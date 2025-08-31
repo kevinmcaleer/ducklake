@@ -1,0 +1,37 @@
+page_count:
+  url: "https://page_count.kevsrobots.com/all-visits"
+  format: "json"
+  expect_schema:
+    url: string
+    ip: string
+    user_agent: string
+    timestamp: datetime
+  partitions:
+    - dt
+  normalize:
+    tz: "UTC"
+search_logs:
+  url: "smb://192.168.1.7/search_logs/search-logs.log"
+  format: "log"
+  expect_schema:
+    timestamp: datetime
+    ip: string
+    query: string
+  parse:
+    # Matches: INFO:root:2024-01-07T13:13:28.736047 - IP: 192.168.1.4 - Query: python
+    # Groups: 1=timestamp, 2=ip, 3=query
+    regex: '^INFO:root:([0-9T:\.\-]+) - IP: ([^ ]+) - Query: (.*)$'
+    fields:
+      timestamp: 1
+      ip: 2
+      query: 3
+    ts_format: "%Y-%m-%dT%H:%M:%S.%f"
+  partitions:
+    - dt
+  normalize:
+    tz: "UTC"
+  # Optional: deduplicate identical lines
+  primary_key:
+    - timestamp
+    - ip
+    - query

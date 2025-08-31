@@ -1,0 +1,11 @@
+venv
+__pycache__/
+*.pyc
+gold
+silver
+bronze
+.DS_Store
+.venv
+reports
+_tmp_downloads
+*.duckdb
