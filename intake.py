@@ -377,7 +377,6 @@ def build_gold_content_rollups(source_name: str, title_col: str = "name", value_
             ORDER BY 2 DESC
         """
 
-    import shutil
     gold_dir = LAKE / "gold" / f"source={source_name}"
     gold_dir.mkdir(parents=True, exist_ok=True)
     # Recursively delete output files if present

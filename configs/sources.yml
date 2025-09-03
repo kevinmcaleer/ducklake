@@ -11,31 +11,57 @@ page_count:
   normalize:
     tz: "UTC"
 search_logs:
+  url: "/Volumes/Search Logs/search-logs.log"
+  format: "log"
+  expect_schema:
+    timestamp: datetime
+    ip: string
+    query: string
+  parse:
+    # Matches: INFO:root:2024-01-07T13:13:28.736047 - IP: 192.168.1.4 - Query: python
+    # Groups: 1=timestamp, 2=ip, 3=query
+    regex: '^INFO:root:([0-9T:\.\-]+) - IP: ([^ ]+) - Query: (.*)$'
+    fields:
+      timestamp: 1
+      ip: 2
+      query: 3
+    ts_format: "%Y-%m-%dT%H:%M:%S.%f"
+  partitions:
+    - dt
+  normalize:
+    tz: "UTC"
+  # Optional: deduplicate identical lines
+  primary_key:
+    - timestamp
+    - ip
+    - query
+
+
   # ...existing config...
 
 # GeoIP sources for country-level enrichment
-geoip_blocks:
-  url: "file://data/geoip/GeoLite2-Country-Blocks-IPv4.csv"
-  format: "csv"
-  expect_schema:
-    network: string
-    geoname_id: string
-    registered_country_geoname_id: string
-    represented_country_geoname_id: string
-    is_anonymous_proxy: int
-    is_satellite_provider: int
-    # ...other columns as needed...
-  partitions: []
+# geoip_blocks:
+#   url: "file://data/geoip/GeoLite2-Country-Blocks-IPv4.csv"
+#   format: "csv"
+#   expect_schema:
+#     network: string
+#     geoname_id: string
+#     registered_country_geoname_id: string
+#     represented_country_geoname_id: string
+#     is_anonymous_proxy: int
+#     is_satellite_provider: int
+#     # ...other columns as needed...
+#   partitions: []
 
-geoip_locations:
-  url: "file://data/geoip/GeoLite2-Country-Locations-en.csv"
-  format: "csv"
-  expect_schema:
-    geoname_id: string
-    locale_code: string
-    continent_code: string
-    continent_name: string
-    country_iso_code: string
-    country_name: string
-    # ...other columns as needed...
-  partitions: []
+# geoip_locations:
+#   url: "file://data/geoip/GeoLite2-Country-Locations-en.csv"
+#   format: "csv"
+#   expect_schema:
+#     geoname_id: string
+#     locale_code: string
+#     continent_code: string
+#     continent_name: string
+#     country_iso_code: string
+#     country_name: string
+#     # ...other columns as needed...
+#   partitions: []

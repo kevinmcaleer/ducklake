@@ -1,0 +1,1 @@
+-- Dimensions SQL: SCD dimensions
