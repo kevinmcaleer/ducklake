@@ -10,3 +10,4 @@ reports
 _tmp_downloads
 *.duckdb
 data
+*.ducklake

@@ -7,3 +7,4 @@
 - what content is most engaging
 - what content is the least engaging
 
+Next I want to create a jupyter notebook to explore the results

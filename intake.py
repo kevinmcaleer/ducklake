@@ -313,10 +313,15 @@ def build_silver_from_manifest(source_name: str, cfg: Dict):
         pk_cols = ", ".join([_ident(c) for c in primary_key])
         union_sql = f"SELECT * FROM (\n{union_sql}\n) t QUALIFY row_number() OVER (PARTITION BY {pk_cols} ORDER BY ts DESC NULLS LAST) = 1"
 
+
+    import shutil
     silver_dir = LAKE / "silver" / f"source={source_name}"
     silver_dir.mkdir(parents=True, exist_ok=True)
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     out_dir = silver_dir / f"run={run}"
+    # Recursively delete output dir if it exists
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_glob = str(out_dir / "part.parquet")
     copy_sql = f"COPY ({union_sql}) TO '{_sql_str(out_glob)}' (FORMAT PARQUET, PARTITION_BY (dt))"
@@ -329,6 +334,19 @@ def build_silver_from_manifest(source_name: str, cfg: Dict):
 
 def build_gold_content_rollups(source_name: str, title_col: str = "name", value_col: str = "value", agg: str = "sum"):
     silver_view = f"silver_{source_name}"
+    # Check if silver view exists
+    try:
+        desc = conn.execute(f"DESCRIBE { _ident(silver_view) }").fetchall()
+    except duckdb.Error:
+        print(f"No silver view for source={source_name}, skipping gold rollups.")
+        return
+
+    # Only run gold if title_col exists in the view
+    colnames = {row[0] for row in desc}
+    if title_col not in colnames:
+        print(f"Skipping gold rollup for {source_name}: column '{title_col}' not found in silver view.")
+        return
+
     if agg.lower() == "count":
         daily_sql = f"""
             SELECT dt, {_ident(title_col)} AS title, COUNT(*) AS total_value
@@ -343,6 +361,9 @@ def build_gold_content_rollups(source_name: str, title_col: str = "name", value_
             ORDER BY 2 DESC
         """
     else:
+        if value_col not in colnames:
+            print(f"Skipping gold rollup for {source_name}: column '{value_col}' not found in silver view.")
+            return
         daily_sql = f"""
             SELECT dt, {_ident(title_col)} AS title, SUM(CAST({_ident(value_col)} AS DOUBLE)) AS total_value
             FROM {_ident(silver_view)}
@@ -356,11 +377,14 @@ def build_gold_content_rollups(source_name: str, title_col: str = "name", value_
             ORDER BY 2 DESC
         """
 
+    import shutil
     gold_dir = LAKE / "gold" / f"source={source_name}"
     gold_dir.mkdir(parents=True, exist_ok=True)
-    # Overwrite: remove existing parquet files if present
-    (gold_dir / 'daily.parquet').unlink(missing_ok=True)
-    (gold_dir / 'all_time.parquet').unlink(missing_ok=True)
+    # Recursively delete output files if present
+    for fname in ['daily.parquet', 'all_time.parquet']:
+        fpath = gold_dir / fname
+        if fpath.exists():
+            fpath.unlink()
     conn.execute(
         f"COPY ({daily_sql}) TO '{_sql_str(str(gold_dir / 'daily.parquet'))}' (FORMAT PARQUET)"
     )
@@ -472,6 +496,8 @@ def cli():
             data = resp.read()
             ctype = resp.headers.get("Content-Type", "").lower()
         tmp_path.write_bytes(data)
+
+        # If JSON, check for top-level array or array under a key (e.g., 'visits')
         fmt = args.format
         if not fmt:
             if "/json" in ctype or name.endswith(".json"):
@@ -484,7 +510,46 @@ def cli():
                 fmt = "yaml"
             else:
                 fmt = "csv"
-        dest, status = ingest_bronze(args.source, str(tmp_path), fmt, dt_override=args.dt, meta={"source_url": u, "content_type": ctype})
+
+        # Special handling for JSON: flatten top-level array or array under a key
+        used_flattened = False
+        if fmt == "json":
+            try:
+                text = data.decode("utf-8")
+                js = json.loads(text)
+                # If it's a dict with a single key and value is a list, flatten
+                if isinstance(js, dict):
+                    for k in ("visits", "items", "data", "records"):
+                        if k in js and isinstance(js[k], list):
+                            arr = js[k]
+                            flat_path = tmp_path.with_suffix(".jsonl")
+                            with flat_path.open("w", encoding="utf-8") as f:
+                                for rec in arr:
+                                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            orig_path = tmp_path.with_suffix(".orig.json")
+                            orig_path.write_bytes(data)
+                            tmp_path = flat_path
+                            used_flattened = True
+                            break
+                elif isinstance(js, list):
+                    flat_path = tmp_path.with_suffix(".jsonl")
+                    with flat_path.open("w", encoding="utf-8") as f:
+                        for rec in js:
+                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    orig_path = tmp_path.with_suffix(".orig.json")
+                    orig_path.write_bytes(data)
+                    tmp_path = flat_path
+                    used_flattened = True
+            except Exception as e:
+                print(f"WARN: Could not flatten JSON: {e}")
+
+        # Always use .jsonl if it was created
+        if fmt == "json" and used_flattened:
+            bronze_path = tmp_path
+        else:
+            bronze_path = tmp_path
+
+        dest, status = ingest_bronze(args.source, str(bronze_path), fmt, dt_override=args.dt, meta={"source_url": u, "content_type": ctype})
         print(json.dumps({"dest": dest, "status": status}, indent=2))
     elif args.cmd == "silver":
         build_silver_from_manifest(args.source, (cfg or {}).get(args.source, {}))
