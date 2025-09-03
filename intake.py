@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover
 
 ROOT = pathlib.Path(__file__).resolve().parent
 LAKE = ROOT
-DUCKDB_DIR = ROOT / "duckdb"
+DUCKDB_DIR = ROOT / "duckdb_utils"
 DUCKDB_DIR.mkdir(parents=True, exist_ok=True)
 DB = str(DUCKDB_DIR / "lake.duckdb")
 conn = duckdb.connect(DB)
