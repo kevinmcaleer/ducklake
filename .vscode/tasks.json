@@ -1,0 +1,32 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "ducklake-refresh",
+			"type": "shell",
+			"command": "python intake.py refresh",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "ducklake-refresh-py3",
+			"type": "shell",
+			"command": "python3 intake.py refresh",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "ducklake-refresh-py3",
+			"type": "shell",
+			"command": "python3 intake.py refresh",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}

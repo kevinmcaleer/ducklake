@@ -1,8 +1,11 @@
 ```mermaid
+---
+id: 7c1731cf-b861-479a-8ee2-2106c0fc1d89
+---
 flowchart LR
 
   %% Sources
-  subgraph S
+  subgraph Sources
     direction TB
     S1["Manual snapshots (CSV, JSON, Parquet)"]
     S2["API snapshots (httpx, requests)"]
@@ -10,14 +13,14 @@ flowchart LR
   S[Sources]
 
   %% Orchestration
-  subgraph O
+  subgraph Orchestration
     direction TB
     O1["Cron / Prefect / Dagster"]
   end
   O[Orchestration]
 
   %% Bronze
-  subgraph B
+  subgraph Bronze
     direction TB
     B0["Write raw file to bronze"]
     B1["Compute SHA256 & file size"]
@@ -28,7 +31,7 @@ flowchart LR
   B[Bronze Zone]
 
   %% Silver
-  subgraph V
+  subgraph Silver
     direction TB
     V0["Load Bronze files"]
     V1["Coerce dtypes (pandas/pandera)"]
@@ -40,7 +43,7 @@ flowchart LR
   V[Silver Zone]
 
   %% Gold
-  subgraph G
+  subgraph Gold
     direction TB
     G0["External views (DuckDB)"]
     G1["Transformations in SQL"]
@@ -51,7 +54,7 @@ flowchart LR
   G[Gold Zone]
 
   %% Consumers
-  subgraph C
+  subgraph Consumers
     direction TB
     C1["DuckDB CLI / Jupyter"]
     C2["Exports for BI tools"]
@@ -77,4 +80,10 @@ flowchart LR
   G3 --> C1
   G3 --> C2
   G3 --> C3
+  style Orchestration fill:#FFF9C4
+  style Sources fill:#C8E6C9
+  style Bronze fill:#BBDEFB
+  style Silver fill:#E1BEE7
+  style Gold fill:#FFE0B2
+  style Consumers fill:#FFCDD2
 ```

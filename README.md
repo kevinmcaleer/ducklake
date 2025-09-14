@@ -31,15 +31,12 @@ source .venv/bin/activate
 
 - Local file:
   ```bash
-  python intake.py ingest-file page_count path/to/file.csv --format csv --dt 2025-08-31
   ```
 - URL:
   ```bash
-  python intake.py ingest-url page_count "https://page_count.kevsrobots.com/all-visits" --format json --dt 2025-08-31
   ```
 - SQLite:
   ```bash
-  python intake.py ingest-sqlite website_pages path/to/analytics.db events --dt 2025-08-31
   ```
 
 ### 3. Build silver and gold
@@ -64,19 +61,33 @@ This will ingest, build silver/gold, and run reports for all sources in `configs
 
 - In Python:
   ```python
-  import duckdb; con=duckdb.connect('duckdb/lake.duckdb'); print(con.execute('SELECT * FROM gold_page_count_all_time LIMIT 10').fetchdf())
   ```
 - Ad-hoc SQL:
   ```bash
-  duckdb duckdb/lake.duckdb -c ".read queries.sql"
   ```
 - Export CSV reports:
   ```bash
-  duckdb duckdb/lake.duckdb -c ".read reports.sql"
   ```
 
 ## GeoIP Enrichment
 
+### Running tests
+
+Install dev dependencies and run the tests:
+
+Using uv:
+
+```sh
+uv pip install -r requirements-dev.txt
+pytest -q
+```
+
+Using pip:
+
+```sh
+python -m pip install -r requirements-dev.txt
+pytest -q
+```
 1. Download GeoLite2 CSVs from MaxMind and place in `data/geoip/`.
 2. Add `geoip_blocks` and `geoip_locations` to `configs/sources.yml` (see example).
 3. Run:
@@ -93,16 +104,12 @@ This will ingest, build silver/gold, and run reports for all sources in `configs
 - To run the full pipeline and generate reports daily (via cron):
   ```cron
   0 2 * * * cd /path/to/ducklake && /usr/bin/python3 run_imports.py --reports >> logs/cron.log 2>&1
-  ```
 
 ## Troubleshooting
 
 - If you see lock errors, remove `.ducklake.lock` if no other run is active.
 - If gold rollups fail, check your config and ensure the correct columns exist in silver.
 - For GeoIP, ensure the CSVs are present and configs are correct.
-
-## Configs
-
 Define sources in `configs/sources.yml`. Example:
 
 ```yaml
@@ -123,9 +130,6 @@ Notes:
 - `expect_schema` drives casting in silver; include a `ts` column to derive dt from it, otherwise the bronze dt is used.
 - `primary_key` (optional) enables dedupe keeping the latest ts.
 - All silver and gold outputs are Parquet and accessible as DuckDB views.
-
-## Configs
-
 Define sources in `configs/sources.yml`. Example shipped:
 
 ```yaml

@@ -6,5 +6,5 @@
 - are visits increasing or decreasing
 - what content is most engaging
 - what content is the least engaging
+- most popular this week, search terms, pages and youtube views
 
-Next I want to create a jupyter notebook to explore the results

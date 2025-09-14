@@ -4,23 +4,44 @@ import json
 import pathlib
 import sys
 import time
+import shutil
 from datetime import date, datetime
 from typing import Dict, Optional
 
 import duckdb
 import re
+from ducklake_core.bronze import ingest_bronze as bronze_ingest, backfill_manifest_from_bronze as bronze_backfill
+
+# Modular imports
+from ducklake_core.manifest import get_manifest_rows, print_manifest
+from ducklake_core.silver import build_silver_from_manifest as silver_build
+from ducklake_core.gold import build_gold_content_rollups as gold_build
+from ducklake_core.report_views import create_report_views
 
 try:
     import yaml  # type: ignore
 except ImportError:  # pragma: no cover
     yaml = None
 
+import logging
+
 ROOT = pathlib.Path(__file__).resolve().parent
 LAKE = ROOT
 DUCKDB_DIR = ROOT / "duckdb_utils"
 DUCKDB_DIR.mkdir(parents=True, exist_ok=True)
 DB = str(DUCKDB_DIR / "lake.duckdb")
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger("ducklake")
+logger.setLevel(logging.ERROR)
+logger.debug(f"Using DuckDB database at: {DB}")
 conn = duckdb.connect(DB)
+
+# Print all sources in manifest for debug
+try:
+    manifest_sources = conn.execute("SELECT source, dt, path, format, rows FROM manifest").fetchall()
+    logger.debug(f"manifest table rows at startup: {manifest_sources}")
+except Exception as e:
+    logger.debug(f"Could not read manifest table: {e}")
 
 # Manifest for bronze files
 conn.execute(
@@ -99,79 +120,128 @@ def type_cast_sql(expect_schema: Dict[str, str], src_alias: Optional[str] = None
 
 
 def ingest_bronze(source_name: str, raw_path: str, fmt: str, dt_override: Optional[str] = None, meta: Optional[Dict] = None):
-    p = pathlib.Path(raw_path)
-    if not p.exists():
-        raise FileNotFoundError(raw_path)
-    dt_ = dt_override or date.today().isoformat()
+    """Wrapper calling bronze.ingest with current connection and lake root."""
+    return bronze_ingest(conn, LAKE, source_name, raw_path, fmt, dt_override=dt_override, meta=meta)
+
+
+def backfill_manifest_from_bronze(source_name: str):
+    """Wrapper calling bronze.backfill with current connection and lake root."""
+    return bronze_backfill(conn, LAKE, source_name)
+
+
+def ingest_from_config(source_name: str, src_cfg: Dict):
+    """Ingest latest data for a source based on its config url/format.
+
+    - http(s): fetch and ingest (flatten JSON arrays heuristically)
+    - file path: copy into bronze with configured format
+    Skips duplicates by content hash automatically via bronze ingest.
+    """
+    url = (src_cfg or {}).get("url")
+    fmt_cfg = (src_cfg or {}).get("format")
+    if not url:
+        return
     try:
-        dt_ = datetime.fromisoformat(dt_).date().isoformat()
-    except (TypeError, ValueError):
+        # Local file path
+        p = pathlib.Path(url)
+        if p.exists():
+            fmt = (fmt_cfg or p.suffix.lstrip(".") or "csv").lower()
+            # Show progress bar for file read
+            file_size = p.stat().st_size
+            with p.open("rb") as f, tqdm.tqdm(total=file_size, unit="B", unit_scale=True, desc=f"Ingesting {p.name}") as bar:
+                chunk_size = 1024 * 1024
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    bar.update(len(chunk))
+            ingest_bronze(source_name, str(p), fmt)
+            return
+    except Exception:
         pass
-    run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    dest_dir = LAKE / "bronze" / f"source={source_name}" / f"format={fmt.lower()}" / f"dt={dt_}" / f"run={run}"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / p.name
+    # HTTP/HTTPS
+    if isinstance(url, str) and (url.startswith("http://") or url.startswith("https://")):
+        import urllib.request
+        from urllib.parse import urlparse
+        import ssl as _ssl
+        cafile = None
+        try:
+            import certifi  # type: ignore
+            cafile = certifi.where()
+        except Exception:
+            cafile = None
+        run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        tmp_dir = ROOT / "_tmp_downloads"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        parsed = urlparse(url)
+        name = pathlib.Path(parsed.path).name or f"download_{run}"
+        tmp_path = tmp_dir / name
+        req = urllib.request.Request(url, headers={"User-Agent": "ducklake/1.0"})
+        ctx = _ssl.create_default_context()
+        if cafile:
+            try:
+                ctx.load_verify_locations(cafile=cafile)
+            except Exception:
+                pass
+        with urllib.request.urlopen(req, context=ctx) as resp:  # nosec B310
+            total = int(resp.headers.get("Content-Length", 0))
+            data = bytearray()
+            with tqdm.tqdm(total=total, unit="B", unit_scale=True, desc=f"Downloading {name}") as bar:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    bar.update(len(chunk))
+            ctype = resp.headers.get("Content-Type", "").lower()
+        tmp_path.write_bytes(data)
+        fmt = (fmt_cfg or ("json" if "/json" in ctype or name.endswith(".json") else ("csv" if "/csv" in ctype or name.endswith(".csv") else ("parquet" if "parquet" in ctype or name.endswith(".parquet") else ("yaml" if "yaml" in ctype or name.endswith((".yaml", ".yml")) else "csv")))))
+        # Flatten common JSON envelope shapes to .jsonl
+        used_flattened = False
+        if fmt == "json":
+            try:
+                text = data.decode("utf-8")
+                js = json.loads(text)
+                if isinstance(js, dict):
+                    for k in ("visits", "items", "data", "records"):
+                        if k in js and isinstance(js[k], list):
+                            arr = js[k]
+                            flat_path = tmp_path.with_suffix(".jsonl")
+                            with flat_path.open("w", encoding="utf-8") as f:
+                                for rec in arr:
+                                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            tmp_path = flat_path
+                            used_flattened = True
+                            break
+                elif isinstance(js, list):
+                    flat_path = tmp_path.with_suffix(".jsonl")
+                    with flat_path.open("w", encoding="utf-8") as f:
+                        for rec in js:
+                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    tmp_path = flat_path
+                    used_flattened = True
+            except Exception:
+                pass
+        ingest_bronze(source_name, str(tmp_path), fmt, meta={"source_url": url})
 
-    fmt_l = fmt.lower()
-    original_name = p.name
-    if fmt_l in ("yaml", "yml"):
-        if yaml is None:
-            raise RuntimeError("PyYAML is required to ingest YAML. Install with: uv pip install pyyaml")
-        data = yaml.safe_load(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            if "items" in data and isinstance(data["items"], list):
-                records = data["items"]
-            else:
-                records = [data]
-        elif isinstance(data, list):
-            records = data
-        else:
-            records = [{"value": data}]
-        json_path = dest.with_suffix(".json")
-        with json_path.open("w", encoding="utf-8") as jf:
-            for rec in records:
-                jf.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        orig_copy = dest.with_suffix(".yaml")
-        orig_copy.write_bytes(p.read_bytes())
-        dest = json_path
-        fmt_l = "json"
-        fmt = "json"
-        meta = {**(meta or {}), "original_format": "yaml", "original_name": original_name}
-    else:
-        dest.write_bytes(p.read_bytes())
 
-    digest = sha256_file(dest)
-    exists = conn.execute("SELECT 1 FROM manifest WHERE content_sha256 = ?", [digest]).fetchone()
-    if exists:
-        return str(dest), "SKIPPED_DUPLICATE"
-
-    rows = 0
-    if fmt_l == "csv":
-        res = conn.execute(f"SELECT count(*) FROM read_csv_auto('{_sql_str(str(dest))}')").fetchone()
-        rows = res[0] if res else 0
-    elif fmt_l == "json":
-        res = conn.execute(f"SELECT count(*) FROM read_json_auto('{_sql_str(str(dest))}')").fetchone()
-        rows = res[0] if res else 0
-    elif fmt_l in ("parquet", "pq"):
-        res = conn.execute(f"SELECT count(*) FROM read_parquet('{_sql_str(str(dest))}')").fetchone()
-        rows = res[0] if res else 0
-
-    conn.execute(
-        """
-      INSERT INTO manifest VALUES (?, now(), ?, ?, ?, ?, ?, ?, ?)
-    """,
-        [
-            source_name,
-            dt_,
-            str(dest),
-            dest.stat().st_size,
-            digest,
-            rows,
-            fmt,
-            json.dumps(meta or {}),
-        ],
-    )
-    return str(dest), "INGESTED"
+def run_reports_sql(conn: duckdb.DuckDBPyConnection):
+    """Execute the SQL script that writes CSV reports to ./reports."""
+    reports_dir = ROOT / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    sql_path = ROOT / "sql" / "reports.sql"
+    if not sql_path.exists():
+        logger.warning(f"reports.sql not found at {sql_path}")
+        return
+    txt = sql_path.read_text(encoding="utf-8")
+    # Naive split on semicolons; sufficient for our simple COPY statements
+    for stmt in txt.split(";"):
+        s = stmt.strip()
+        if not s:
+            continue
+        try:
+            conn.execute(s)
+        except Exception as e:
+            logger.warning(f"Failed to execute report statement: {str(e)}\nSQL: {s[:200]}...")
 
 
 def _read_sql_for(path_str: str, fmt: str) -> str:
@@ -205,42 +275,114 @@ def _read_sql_for(path_str: str, fmt: str) -> str:
 
 
 def build_silver_from_manifest(source_name: str, cfg: Dict):
+    # Ensure all manifest changes are committed and visible
+    conn.commit()
     expect_schema: Dict[str, str] = (cfg.get("expect_schema") or {}) if cfg else {}
     tz = (cfg.get("normalize") or {}).get("tz") if cfg else None
     primary_key = cfg.get("primary_key") if cfg else None
 
-    rows = conn.execute(
-        """
-        SELECT path, format, dt
-        FROM manifest
-        WHERE source = ?
-        ORDER BY run_ts
-        """,
-        [source_name],
-    ).fetchall()
+    logger.debug(f"source_name repr: {repr(source_name)}")
+    manifest_dump = conn.execute("SELECT source, dt, path, format, rows FROM manifest").fetchall()
+    logger.debug(f"manifest table rows before query: {manifest_dump}")
+    manifest_sources = conn.execute("SELECT DISTINCT source FROM manifest").fetchall()
+    logger.debug(f"manifest sources repr: {[repr(s[0]) for s in manifest_sources]}")
+    rows = get_manifest_rows(conn, source_name)
+    logger.debug(f"Manifest query returned rows: {rows}")
     if not rows:
-        print(f"No bronze files for source={source_name}")
+        logger.info(f"No bronze files for source={source_name}")
         return
 
     selects: list[str] = []
+    missing_count = 0
+    silver_dir = LAKE / "silver" / f"source={source_name}"
+    silver_dir.mkdir(parents=True, exist_ok=True)
+    import os
     for path_str, fmt, dt in rows:
+        import os
+        exists = os.path.exists(path_str)
+        logger.debug(f"ROW: path={path_str}, format={fmt}, dt={dt}, exists={exists}")
+        if not exists:
+            logger.debug(f"SKIP: File does not exist: {path_str}")
+            continue
+        logger.debug(f"PROCESS: File will be processed: {path_str}")
+        logger.debug(f"Considering file: {path_str} (format={fmt}, dt={dt})")
+        # Skip entries whose files are no longer present on disk
+        try:
+            p = pathlib.Path(path_str)
+            if not p.exists():
+                missing_count += 1
+                logger.warning(f"Skipping missing file referenced in manifest: {path_str}")
+                continue
+        except Exception:
+            missing_count += 1
+            logger.warning(f"Skipping invalid path in manifest: {path_str}")
+            continue
+        logger.debug(f"File exists and will be processed: {path_str}")
         read = _read_sql_for(path_str, fmt)
-        # Optional regex-based parsing for plain text logs
+        appended = False
+        # Always attempt regex-based parsing for log files, even if only one column exists
         if (fmt or "").lower() == "log":
             try:
                 cols_probe = [r[0] for r in conn.execute(f"DESCRIBE ({read})").fetchall()]
             except duckdb.Error:
                 cols_probe = []
             lower_cols = {c.lower() for c in cols_probe}
-            if "text" in lower_cols or "content" in lower_cols:
-                parse = (cfg or {}).get("parse") or {}
-                regex = parse.get("regex")
-                fields = parse.get("fields") or {}
-                ts_fmt = parse.get("ts_format")
-                if regex and isinstance(fields, dict) and fields:
+            parse = (cfg or {}).get("parse") or {}
+            regex = parse.get("regex")
+            fields = parse.get("fields") or {}
+            ts_fmt = parse.get("ts_format")
+            # If the log is read as a single column, always alias as 'line' for regex extraction
+            logger.debug(f"regex={regex}, fields={fields}, type={type(fields)}")
+            if regex and isinstance(fields, dict) and fields:
+                # Always alias the log line column as 'line' for regex extraction
+                log_line_col = None
+                for c in cols_probe:
+                    if c.lower() not in {"dt", "format", "run", "source"}:
+                        log_line_col = c
+                        break
+                if not log_line_col and cols_probe:
+                    log_line_col = cols_probe[0]
+                read = f"SELECT * FROM (SELECT {log_line_col} AS line FROM ({read})) AS t"
+                src_col = "line"
+                # Build regex extraction SQL for log files
+                regex_sql = _sql_str(regex)
+                exprs: list[str] = []
+                main_field = None
+                for name, grp in fields.items():
+                    try:
+                        gi = int(grp)
+                    except (TypeError, ValueError):
+                        continue
+                    base = f"regexp_extract(t.{src_col}, '{regex_sql}', {gi})"
+                    if ts_fmt and name in ("timestamp", "ts"):
+                        fmt_sql = _sql_str(ts_fmt)
+                        expr = f"strptime(NULLIF(trim({base}), ''), '{fmt_sql}') AS {_ident(name)}"
+                        main_field = _ident(name)
+                    else:
+                        expr = f"{base} AS {_ident(name)}"
+                    exprs.append(expr)
+                if exprs:
+                    # Only keep rows where the main parsed field (timestamp/ts) is not NULL
+                    if main_field:
+                        read = f"SELECT * FROM (SELECT {', '.join(exprs)} FROM ({read}) t) WHERE {main_field} IS NOT NULL"
+                    else:
+                        read = f"SELECT {', '.join(exprs)} FROM ({read}) t"
+                # Add the final read SQL to selects for union
+                selects.append(f"SELECT *, '{dt}' AS dt FROM ({read}) r")
+                appended = True
+            else:
+                # Find the first column to use as the source text (always use first if text/content not present)
+                src_col = None
+                for candidate in ("text", "content"):
+                    if candidate in lower_cols:
+                        src_col = candidate
+                        break
+                if not src_col and cols_probe:
+                    src_col = cols_probe[0]
+                if src_col:
                     regex_sql = _sql_str(regex)
-                    src_col = "text" if "text" in lower_cols else "content"
                     exprs: list[str] = []
+                    main_field = None
                     for name, grp in fields.items():
                         try:
                             gi = int(grp)
@@ -250,11 +392,17 @@ def build_silver_from_manifest(source_name: str, cfg: Dict):
                         if ts_fmt and name in ("timestamp", "ts"):
                             fmt_sql = _sql_str(ts_fmt)
                             expr = f"strptime(NULLIF(trim({base}), ''), '{fmt_sql}') AS {_ident(name)}"
+                            main_field = _ident(name)
                         else:
                             expr = f"{base} AS {_ident(name)}"
                         exprs.append(expr)
                     if exprs:
-                        read = f"SELECT {', '.join(exprs)} FROM ({read}) t"
+                        # Only keep rows where the main parsed field (timestamp/ts) is not NULL
+                        if main_field:
+                            read = f"SELECT * FROM (SELECT {', '.join(exprs)} FROM ({read}) t) WHERE {main_field} IS NOT NULL"
+                        else:
+                            read = f"SELECT {', '.join(exprs)} FROM ({read}) t"
+                # If not appended yet, append generic projection below
         # Discover available columns in this read
         try:
             cols = [r[0] for r in conn.execute(f"DESCRIBE ({read})").fetchall()]
@@ -276,127 +424,75 @@ def build_silver_from_manifest(source_name: str, cfg: Dict):
                     select_parts.append(duck_t)
                 else:
                     # missing column -> NULL
-                    t = (v or "").lower()
-                    if t in ("datetime", "timestamp"):
-                        null_t = "TIMESTAMP"
-                    elif t in ("date",):
-                        null_t = "DATE"
-                    elif t in ("int", "integer"):
-                        null_t = "BIGINT"
-                    elif t in ("float", "double", "numeric", "decimal"):
-                        null_t = "DOUBLE"
-                    else:
-                        null_t = "VARCHAR"
-                    select_parts.append(f"CAST(NULL AS {null_t}) AS {_ident(k)}")
-        else:
-            select_parts.append("r.*")
-
-        # ts and dt expressions
-        if ts_col and ts_col in colset:
-            if tz:
-                tz_lit = _sql_str(tz)
-                ts_expr = f"(CAST(r.{_col_ref(ts_col)} AS TIMESTAMP) AT TIME ZONE '{tz_lit}') AT TIME ZONE 'UTC' AS ts"
-                dt_expr = f"CAST((CAST(r.{_col_ref(ts_col)} AS TIMESTAMP) AT TIME ZONE '{tz_lit}') AS DATE) AS dt"
-            else:
-                ts_expr = f"CAST(r.{_col_ref(ts_col)} AS TIMESTAMP) AS ts"
-                dt_expr = f"CAST(r.{_col_ref(ts_col)} AS DATE) AS dt"
-        else:
-            ts_expr = "CAST(NULL AS TIMESTAMP) AS ts"
-            dt_expr = f"CAST('{_sql_str(str(dt))}' AS DATE) AS dt"
-
-        select_list = ", ".join(select_parts) if select_parts else "r.*"
-        selects.append(f"SELECT {select_list}, {ts_expr}, {dt_expr} FROM ({read}) r")
-
-    union_sql = "\nUNION ALL\n".join(selects)
-
-    if primary_key:
-        pk_cols = ", ".join([_ident(c) for c in primary_key])
-        union_sql = f"SELECT * FROM (\n{union_sql}\n) t QUALIFY row_number() OVER (PARTITION BY {pk_cols} ORDER BY ts DESC NULLS LAST) = 1"
-
-
-    import shutil
-    silver_dir = LAKE / "silver" / f"source={source_name}"
-    silver_dir.mkdir(parents=True, exist_ok=True)
-    run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    out_dir = silver_dir / f"run={run}"
-    # Recursively delete output dir if it exists
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_glob = str(out_dir / "part.parquet")
-    copy_sql = f"COPY ({union_sql}) TO '{_sql_str(out_glob)}' (FORMAT PARQUET, PARTITION_BY (dt))"
-    conn.execute(copy_sql)
-
-    view_sql = f"CREATE OR REPLACE VIEW silver_{_ident(source_name)} AS SELECT * FROM read_parquet('{_sql_str(str(silver_dir))}/**/*.parquet')"
-    conn.execute(view_sql)
-    print(f"Silver built for source={source_name} at {silver_dir}")
+                    if (fmt or "").lower() == "log":
+                        parse = (cfg or {}).get("parse") or {}
+                        regex = parse.get("regex")
+                        ts_fmt = parse.get("ts_format")
+                        # For log files, always use the proven SQL pattern: read as 'line', then extract
+                        if regex:
+                            regex_sql = _sql_str(regex)
+                            # Use the expected field mapping for search_logs
+                            # If ts_fmt is set, parse timestamp
+                            if ts_fmt:
+                                fmt_sql = _sql_str(ts_fmt)
+                                read = f"SELECT strptime(NULLIF(trim(regexp_extract(line, '{regex_sql}', 1)), ''), '{fmt_sql}') AS timestamp, regexp_extract(line, '{regex_sql}', 2) AS ip, regexp_extract(line, '{regex_sql}', 3) AS query FROM (SELECT * FROM read_csv_auto('{_sql_str(path_str)}', delim='\n'))"
+                            else:
+                                read = f"SELECT regexp_extract(line, '{regex_sql}', 1) AS timestamp, regexp_extract(line, '{regex_sql}', 2) AS ip, regexp_extract(line, '{regex_sql}', 3) AS query FROM (SELECT * FROM read_csv_auto('{_sql_str(path_str)}', delim='\n'))"
+                        # If not appended yet, append generic projection below
+        # Append a SELECT for this file if not already added in log branch
+        if not appended:
+            projection = ", ".join(select_parts) if select_parts else "*"
+            selects.append(f"SELECT {projection}, '{dt}' AS dt FROM ({read}) r")
+    # After the for-loop, check if any selects were built
+    if not selects:
+        msg = f"No usable bronze files for source={source_name}"
+        if missing_count:
+            msg += f" (skipped {missing_count} missing)"
+        logger.info(msg)
+        return
+    # Delegate to silver module
+    return silver_build(conn, LAKE, source_name, cfg)
 
 
 def build_gold_content_rollups(source_name: str, title_col: str = "name", value_col: str = "value", agg: str = "sum"):
-    silver_view = f"silver_{source_name}"
-    # Check if silver view exists
-    try:
-        desc = conn.execute(f"DESCRIBE { _ident(silver_view) }").fetchall()
-    except duckdb.Error:
-        print(f"No silver view for source={source_name}, skipping gold rollups.")
-        return
+    return gold_build(conn, LAKE, source_name, title_col=title_col, value_col=value_col, agg=agg)
 
-    # Only run gold if title_col exists in the view
-    colnames = {row[0] for row in desc}
-    if title_col not in colnames:
-        print(f"Skipping gold rollup for {source_name}: column '{title_col}' not found in silver view.")
-        return
 
-    if agg.lower() == "count":
-        daily_sql = f"""
-            SELECT dt, {_ident(title_col)} AS title, COUNT(*) AS total_value
-            FROM {_ident(silver_view)}
-            GROUP BY 1, 2
-            ORDER BY 1 DESC, 3 DESC
-        """
-        alltime_sql = f"""
-            SELECT {_ident(title_col)} AS title, COUNT(*) AS total_value
-            FROM {_ident(silver_view)}
-            GROUP BY 1
-            ORDER BY 2 DESC
-        """
+try:
+    from colorama import init as colorama_init, Fore, Style
+    colorama_init()
+    GREEN = Fore.GREEN
+    RED = Fore.RED
+    RESET = Style.RESET_ALL
+except ImportError:
+    GREEN = ""
+    RED = ""
+    RESET = ""
+
+CHECK = f"{GREEN}✔️{RESET}"
+CROSS = f"{RED}❌{RESET}"
+
+
+def print_task_status(task, status):
+    if status == "ok":
+        print(f"  {CHECK} {task}")
+    elif status == "fail":
+        print(f"  {CROSS} {task}")
     else:
-        if value_col not in colnames:
-            print(f"Skipping gold rollup for {source_name}: column '{value_col}' not found in silver view.")
-            return
-        daily_sql = f"""
-            SELECT dt, {_ident(title_col)} AS title, SUM(CAST({_ident(value_col)} AS DOUBLE)) AS total_value
-            FROM {_ident(silver_view)}
-            GROUP BY 1, 2
-            ORDER BY 1 DESC, 3 DESC
-        """
-        alltime_sql = f"""
-            SELECT {_ident(title_col)} AS title, SUM(CAST({_ident(value_col)} AS DOUBLE)) AS total_value
-            FROM {_ident(silver_view)}
-            GROUP BY 1
-            ORDER BY 2 DESC
-        """
+        print(f"  [ ] {task}")
 
-    gold_dir = LAKE / "gold" / f"source={source_name}"
-    gold_dir.mkdir(parents=True, exist_ok=True)
-    # Recursively delete output files if present
-    for fname in ['daily.parquet', 'all_time.parquet']:
-        fpath = gold_dir / fname
-        if fpath.exists():
-            fpath.unlink()
-    conn.execute(
-        f"COPY ({daily_sql}) TO '{_sql_str(str(gold_dir / 'daily.parquet'))}' (FORMAT PARQUET)"
-    )
-    conn.execute(
-        f"COPY ({alltime_sql}) TO '{_sql_str(str(gold_dir / 'all_time.parquet'))}' (FORMAT PARQUET)"
-    )
-    conn.execute(
-        f"CREATE OR REPLACE VIEW gold_{_ident(source_name)}_daily AS SELECT * FROM read_parquet('{_sql_str(str(gold_dir / 'daily.parquet'))}')"
-    )
-    conn.execute(
-        f"CREATE OR REPLACE VIEW gold_{_ident(source_name)}_all_time AS SELECT * FROM read_parquet('{_sql_str(str(gold_dir / 'all_time.parquet'))}')"
-    )
-    print(f"Gold rollups built for source={source_name} in {gold_dir}")
+
+def print_main_task(task):
+    print(f"\n{task}:")
+
+
+def print_subtask_status(subtask, status):
+    if status == "ok":
+        print(f"    {CHECK} {subtask}")
+    elif status == "fail":
+        print(f"    {CROSS} {subtask}")
+    else:
+        print(f"    [ ] {subtask}")
 
 
 def cli():
@@ -442,7 +538,7 @@ def cli():
         fmt = args.format or pathlib.Path(args.path).suffix.lstrip(".")
         meta = json.loads(args.meta) if args.meta else None
         dest, status = ingest_bronze(args.source, args.path, fmt, dt_override=args.dt, meta=meta)
-        print(json.dumps({"dest": dest, "status": status}, indent=2))
+        logger.info(json.dumps({"dest": dest, "status": status}, indent=2))
     elif args.cmd == "ingest-sqlite":
         sqlite_db = pathlib.Path(args.db)
         if not sqlite_db.exists():
@@ -463,7 +559,7 @@ def cli():
             tmp_parquet.unlink(missing_ok=True)
         except FileNotFoundError:
             pass
-        print(json.dumps({"dest": dest, "status": status}, indent=2))
+        logger.info(json.dumps({"dest": dest, "status": status}, indent=2))
     elif args.cmd == "ingest-url":
         import urllib.request
         from urllib.parse import urlparse
@@ -540,7 +636,7 @@ def cli():
                     tmp_path = flat_path
                     used_flattened = True
             except Exception as e:
-                print(f"WARN: Could not flatten JSON: {e}")
+                logger.warning(f"Could not flatten JSON: {e}")
 
         # Always use .jsonl if it was created
         if fmt == "json" and used_flattened:
@@ -549,21 +645,98 @@ def cli():
             bronze_path = tmp_path
 
         dest, status = ingest_bronze(args.source, str(bronze_path), fmt, dt_override=args.dt, meta={"source_url": u, "content_type": ctype})
-        print(json.dumps({"dest": dest, "status": status}, indent=2))
+        logger.info(json.dumps({"dest": dest, "status": status}, indent=2))
     elif args.cmd == "silver":
-        build_silver_from_manifest(args.source, (cfg or {}).get(args.source, {}))
+        backfill_manifest_from_bronze(args.source)
+        # Print manifest table before building silver
+        manifest_dump = conn.execute("SELECT source, dt, path, format, rows FROM manifest").fetchall()
+        logger.debug(f"manifest table rows before build_silver_from_manifest: {manifest_dump}")
+        build_silver_from_manifest(args.source, ((cfg or {}).get(args.source, {})))
     elif args.cmd == "gold":
-        build_silver_from_manifest(args.source, (cfg or {}).get(args.source, {}))
+        backfill_manifest_from_bronze(args.source)
+        build_silver_from_manifest(args.source, ((cfg or {}).get(args.source, {})))
         build_gold_content_rollups(args.source, title_col=args.title_col, value_col=args.value_col, agg=args.agg)
     elif args.cmd == "refresh":
+        # Group tasks by layer
+        bronze_tasks = []
+        silver_tasks = []
+        gold_tasks = []
         for src_name, src_cfg in (cfg or {}).items():
-            build_silver_from_manifest(src_name, src_cfg)
+            bronze_tasks.append((src_name, [
+                ("Ingest", lambda: ingest_from_config(src_name, src_cfg)),
+                ("Backfill manifest", lambda: backfill_manifest_from_bronze(src_name)),
+            ]))
+            silver_tasks.append((src_name, [
+                ("Build silver", lambda: build_silver_from_manifest(src_name, src_cfg)),
+            ]))
             schema = (src_cfg or {}).get("expect_schema") or {}
-            title_col = "name" if "name" in schema else (next(iter(schema.keys()), "id"))
-            value_col = "value" if "value" in schema else (
-                next((k for k, v in schema.items() if str(v).lower() in ("int", "integer", "float", "double", "numeric", "decimal")), next(iter(schema.keys()), "id"))
-            )
-            build_gold_content_rollups(src_name, title_col=title_col, value_col=value_col)
+            title_col = None
+            if "name" in schema:
+                title_col = "name"
+            elif "url" in schema:
+                title_col = "url"
+            else:
+                string_cols = [k for k, v in schema.items() if str(v).lower() in ("string", "text", "str")]
+                title_col = string_cols[0] if string_cols else (next(iter(schema.keys()), "id"))
+            numeric_cols = [k for k, v in schema.items() if str(v).lower() in ("int", "integer", "float", "double", "numeric", "decimal")]
+            value_col = numeric_cols[0] if numeric_cols else next(iter(schema.keys()), "id")
+            gold_tasks.append((src_name, [
+                ("Build gold", lambda: build_gold_content_rollups(src_name, title_col=title_col, value_col=value_col, agg="sum")),
+            ]))
+        # Reports tasks
+        reports_tasks = [
+            ("Create report views", lambda: create_report_views(conn)),
+            ("Run reports SQL", lambda: run_reports_sql(conn)),
+        ]
+        # Print and run tasks
+        print_main_task("Bronze")
+        for src_name, subtasks in bronze_tasks:
+            print(f"  {src_name}")
+            for sub_name, fn in subtasks:
+                print_subtask_status(sub_name, None)
+                try:
+                    fn()
+                    print_subtask_status(sub_name, "ok")
+                except Exception as e:
+                    print_subtask_status(sub_name, "fail")
+                    logger.error(f"Task failed: Bronze/{src_name}/{sub_name}: {e}")
+        print_main_task("Silver")
+        for src_name, subtasks in silver_tasks:
+            print(f"  {src_name}")
+            for sub_name, fn in subtasks:
+                print_subtask_status(sub_name, None)
+                try:
+                    fn()
+                    print_subtask_status(sub_name, "ok")
+                except Exception as e:
+                    print_subtask_status(sub_name, "fail")
+                    logger.error(f"Task failed: Silver/{src_name}/{sub_name}: {e}")
+        print_main_task("Gold")
+        for src_name, subtasks in gold_tasks:
+            print(f"  {src_name}")
+            for sub_name, fn in subtasks:
+                print_subtask_status(sub_name, None)
+                try:
+                    fn()
+                    print_subtask_status(sub_name, "ok")
+                except Exception as e:
+                    print_subtask_status(sub_name, "fail")
+                    logger.error(f"Task failed: Gold/{src_name}/{sub_name}: {e}")
+        print_main_task("Reports")
+        for sub_name, fn in reports_tasks:
+            print_subtask_status(sub_name, None)
+            try:
+                fn()
+                print_subtask_status(sub_name, "ok")
+            except Exception as e:
+                print_subtask_status(sub_name, "fail")
+                logger.error(f"Task failed: Reports/{sub_name}: {e}")
+        print("\nPipeline complete.")
+        return
+    # After building all sources, (re)create report views
+    create_report_views(conn)
+    # Generate CSV report exports automatically
+    run_reports_sql(conn)
 
 
 if __name__ == "__main__":
