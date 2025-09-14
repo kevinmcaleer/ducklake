@@ -19,10 +19,10 @@ try:
 except ImportError:  # pragma: no cover
     duckdb = None
 
-ROOT = pathlib.Path(__file__).resolve().parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 CFG = ROOT / "configs" / "sources.yml"
 INTAKE = ROOT / "intake.py"
-DB = ROOT / "duckdb" / "lake.duckdb"
+DB = ROOT / "duckdb_utils" / "lake.duckdb"
 LOCK = ROOT / ".ducklake.lock"
 
 

@@ -16,29 +16,18 @@ page_count:
     - url
   # Optionally normalize IP last octet (temporary workaround while proxy forwarding is fixed)
   # ip_force_last_octet: 4
+
 search_logs:
-  url: "/Volumes/Search Logs/search-logs.log"
-  format: "log"
+  url: "_tmp_downloads/search_logs_csv/"
+  format: "csv"
   expect_schema:
     timestamp: datetime
     ip: string
     query: string
-  parse:
-    # Matches: INFO:root:2024-01-07T13:13:28.736047 - IP: 192.168.1.4 - Query: python
-    # Groups: 1=timestamp, 2=ip, 3=query
-    # Choose either regex-based parsing (default) or set method: simple
-    # method: simple  # uncomment to use the simple non-regex parser
-    regex: '^INFO:root:([0-9T:\.\-]+) - IP: ((?:\d{1,3}\.){3}\d{1,3}) - Query: (.*)$'
-    fields:
-      timestamp: 1
-      ip: 2
-      query: 3
-    ts_format: "%Y-%m-%dT%H:%M:%S.%f"
   partitions:
     - dt
   normalize:
     tz: "UTC"
-  # Optional: deduplicate identical lines
   primary_key:
     - timestamp
     - ip

@@ -36,99 +36,14 @@ def build_silver_from_manifest(
 
     for path_str, fmt, dt in rows:
         p = pathlib.Path(path_str)
+        # Skip hidden/system files (e.g., .DS_Store)
+        if p.name.startswith('.'):
+            print(f"SKIP: Hidden/system file in manifest: {path_str}")
+            continue
         if not p.exists():
             print(f"WARN: Skipping missing file referenced in manifest: {path_str}")
             continue
         read = read_sql_for(conn, path_str, fmt)
-        appended = False
-        if (fmt or "").lower() == "log":
-            # Probe columns
-            try:
-                cols_probe = [r[0] for r in conn.execute(f"DESCRIBE ({read})").fetchall()]
-            except duckdb.Error:
-                cols_probe = []
-            lower_cols = {c.lower() for c in cols_probe}
-            regex = parse.get("regex")
-            fields = parse.get("fields") or {}
-            ts_fmt = parse.get("ts_format")
-            method = (parse.get("method") or "").lower() if isinstance(parse, dict) else ""
-            simple = bool(parse.get("simple")) if isinstance(parse, dict) else False
-            if regex and isinstance(fields, dict) and fields:
-                log_line_col = None
-                for c in cols_probe:
-                    if c.lower() not in {"dt", "format", "run", "source"}:
-                        log_line_col = c
-                        break
-                if not log_line_col and cols_probe:
-                    log_line_col = cols_probe[0]
-                read = f"SELECT * FROM (SELECT {log_line_col} AS line FROM ({read})) AS t"
-                src_col = "line"
-                regex_sql = _sql_str(regex)
-                exprs: list[str] = []
-                main_field = None
-                for name, grp in fields.items():
-                    try:
-                        gi = int(grp)
-                    except (TypeError, ValueError):
-                        continue
-                    base = f"regexp_extract(t.{src_col}, '{regex_sql}', {gi})"
-                    if ts_fmt and name in ("timestamp", "ts"):
-                        fmt_sql = _sql_str(ts_fmt)
-                        expr = f"strptime(NULLIF(trim({base}), ''), '{fmt_sql}') AS {_ident(name)}"
-                        main_field = _ident(name)
-                    else:
-                        if name == "ip" and ip_force_octet:
-                            ip_oct_sql = _sql_str(str(ip_force_octet))
-                            expr = (
-                                "CASE WHEN NULLIF(trim(" + base + "), '') IS NOT NULL "
-                                "THEN concat(split_part(" + base + ", '.', 1), '.', split_part(" + base + ", '.', 2), '.', split_part(" + base + ", '.', 3), '.', '" + ip_oct_sql + "') "
-                                "ELSE " + base + " END AS ip"
-                            )
-                        else:
-                            expr = f"{base} AS {_ident(name)}"
-                    exprs.append(expr)
-                if exprs:
-                    if main_field:
-                        read = f"SELECT * FROM (SELECT {', '.join(exprs)} FROM ({read}) t) WHERE {main_field} IS NOT NULL"
-                    else:
-                        read = f"SELECT {', '.join(exprs)} FROM ({read}) t"
-                selects.append(f"SELECT *, '{dt}' AS dt FROM ({read}) r")
-                appended = True
-            elif simple or method == "simple":
-                # Non-regex simple parser: assumes format
-                # "INFO:root:{ts} - IP: {ip} - Query: {query}"
-                log_line_col = None
-                for c in cols_probe:
-                    if c.lower() not in {"dt", "format", "run", "source"}:
-                        log_line_col = c
-                        break
-                if not log_line_col and cols_probe:
-                    log_line_col = cols_probe[0]
-                # Prepare a projection using split_part/strptime to avoid regex
-                # ts_text = split_part(split_part(line, 'INFO:root:', 2), ' - IP: ', 1)
-                # ip      = split_part(split_part(line, ' - IP: ', 2), ' - Query: ', 1)
-                # query   = split_part(line, ' - Query: ', 2)
-                ts_fmt_sql = _sql_str(ts_fmt or "%Y-%m-%dT%H:%M:%S.%f")
-                ip_raw = f"split_part(split_part({log_line_col}, ' - IP: ', 2), ' - Query: ', 1)"
-                if ip_force_octet:
-                    ip_oct_sql = _sql_str(str(ip_force_octet))
-                    ip_expr = (
-                        "CASE WHEN NULLIF(trim(" + ip_raw + "), '') IS NOT NULL "
-                        "THEN concat(split_part(" + ip_raw + ", '.', 1), '.', split_part(" + ip_raw + ", '.', 2), '.', split_part(" + ip_raw + ", '.', 3), '.', '" + ip_oct_sql + "') "
-                        "ELSE " + ip_raw + " END AS ip"
-                    )
-                else:
-                    ip_expr = ip_raw + " AS ip"
-                read = (
-                    "SELECT "
-                    f"strptime(NULLIF(trim(split_part(split_part({log_line_col}, 'INFO:root:', 2), ' - IP: ', 1)), ''), '{ts_fmt_sql}') AS timestamp, "
-                    f"{ip_expr}, "
-                    f"split_part({log_line_col}, ' - Query: ', 2) AS query "
-                    f"FROM ({read})"
-                )
-                selects.append(f"SELECT *, '{dt}' AS dt FROM ({read}) r")
-                appended = True
-        # project expected schema for non-log or fallback
         # Discover available columns
         try:
             cols = [r[0] for r in conn.execute(f"DESCRIBE ({read})").fetchall()]
@@ -142,11 +57,23 @@ def build_silver_from_manifest(
                     duck_t = type_cast_sql({k: v}, src_alias="r")
                     select_parts.append(duck_t)
                 else:
-                    # missing column -> NULL (leave as is for now)
-                    pass
-        if not appended:
-            projection = ", ".join(select_parts) if select_parts else "*"
-            selects.append(f"SELECT {projection}, '{dt}' AS dt FROM ({read}) r")
+                    # missing column -> NULL as colname
+                    t = (v or "").lower()
+                    if t in ("string", "text", "str"):
+                        duck_t = "VARCHAR"
+                    elif t in ("int", "integer"):
+                        duck_t = "BIGINT"
+                    elif t in ("float", "double", "numeric", "decimal"):
+                        duck_t = "DOUBLE"
+                    elif t in ("datetime", "timestamp"):
+                        duck_t = "TIMESTAMP"
+                    elif t in ("date",):
+                        duck_t = "DATE"
+                    else:
+                        duck_t = "VARCHAR"
+                    select_parts.append(f"CAST(NULL AS {duck_t}) AS {_ident(k)}")
+        projection = ", ".join(select_parts) if select_parts else "*"
+        selects.append(f"SELECT {projection}, '{dt}' AS dt FROM ({read}) r")
 
     if not selects:
         print(f"No usable bronze files for source={source_name}")
