@@ -24,6 +24,19 @@ except ImportError:  # pragma: no cover
     yaml = None
 
 import logging
+try:
+    import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    class _TQDMShim:
+        def __init__(self, total=0, unit="", unit_scale=False, desc=""):
+            self.total = total
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def update(self, n):
+            pass
+    tqdm = type("tqdm", (), {"tqdm": _TQDMShim})()  # minimal shim
 
 ROOT = pathlib.Path(__file__).resolve().parent
 LAKE = ROOT
@@ -141,11 +154,33 @@ def ingest_from_config(source_name: str, src_cfg: Dict):
     if not url:
         return
     try:
-        # Local file path
         p = pathlib.Path(url)
         if p.exists():
+            # If it's a directory, ingest all matching files (currently CSV focus)
+            if p.is_dir():
+                patterns = ["*.csv"] if (fmt_cfg or "csv").lower() == "csv" else ["*.*"]
+                files = []
+                for pat in patterns:
+                    files.extend(p.glob(pat))
+                for fpath in sorted(files):
+                    if not fpath.is_file():
+                        continue
+                    fmt = (fmt_cfg or fpath.suffix.lstrip(".") or "csv").lower()
+                    try:
+                        file_size = fpath.stat().st_size
+                        with fpath.open("rb") as f, tqdm.tqdm(total=file_size, unit="B", unit_scale=True, desc=f"Ingesting {fpath.name}") as bar:
+                            chunk_size = 1024 * 1024
+                            while True:
+                                chunk = f.read(chunk_size)
+                                if not chunk:
+                                    break
+                                bar.update(len(chunk))
+                        ingest_bronze(source_name, str(fpath), fmt)
+                    except Exception as e:
+                        logger.error(f"Failed to ingest file {fpath}: {e}")
+                return
+            # Single file path
             fmt = (fmt_cfg or p.suffix.lstrip(".") or "csv").lower()
-            # Show progress bar for file read
             file_size = p.stat().st_size
             with p.open("rb") as f, tqdm.tqdm(total=file_size, unit="B", unit_scale=True, desc=f"Ingesting {p.name}") as bar:
                 chunk_size = 1024 * 1024
@@ -529,10 +564,99 @@ def cli():
     p_gold.add_argument("--agg", choices=["sum", "count"], default="sum", help="Aggregation: sum (default) or count")
 
     sub.add_parser("refresh", help="Build silver and gold for all sources in configs/sources.yml")
+    sub.add_parser("reports-only", help="Run only report view creation and reports SQL (skip bronze/silver/gold)")
+    sub.add_parser("cleanup-manifest", help="Remove manifest rows whose files are missing")
+    sub.add_parser("simple-validate", help="Run validation only for simplified pipeline objects and emit JSON")
+
+    p_ingest_today = sub.add_parser("ingest-today-searches", help="Ingest local 'today' search log CSVs from ./data/search_logs/today or similar")
+    p_ingest_today.add_argument("--path", default="data/search_logs", help="Base directory containing daily search CSVs")
+    sub.add_parser("simple-refresh", help="Run simplified pipeline (raw CSV -> parquet -> daily aggregates -> reports)")
+    sub.add_parser("bootstrap-raw", help="Export existing silver tables into data/raw/<source>/dt=*/ CSV layout")
+    p_fast = sub.add_parser("fast-bootstrap-lake", help="Directly export silver tables into data/lake/<source>/dt=*.parquet")
+    p_fast.add_argument('--overwrite', action='store_true', help='Overwrite existing partitions')
 
     args = parser.parse_args()
     ensure_dirs()
     cfg = load_sources_config(ROOT / "configs" / "sources.yml")
+
+    def cleanup_manifest():
+        rows = conn.execute("SELECT source, dt, path FROM manifest").fetchall()
+        removed = 0
+        for source, dtv, pth in rows:
+            try:
+                if not pathlib.Path(pth).exists():
+                    conn.execute("DELETE FROM manifest WHERE source=? AND dt=? AND path=?", [source, dtv, pth])
+                    removed += 1
+            except Exception:
+                pass
+        # Additional prune: obsolete search_logs rows with format=log once CSV/parquet migration complete
+        try:
+            obsolete = conn.execute("SELECT COUNT(*) FROM manifest WHERE source='search_logs' AND lower(format)='log'").fetchone()[0]
+            if obsolete:
+                conn.execute("DELETE FROM manifest WHERE source='search_logs' AND lower(format)='log'")
+                print(f"Removed {removed} stale manifest rows (+ pruned {obsolete} obsolete search_logs log entries)")
+                return
+        except Exception:
+            pass
+        print(f"Removed {removed} stale manifest rows")
+
+    if args.cmd == "cleanup-manifest":
+        cleanup_manifest()
+        return
+
+    if args.cmd == "simple-validate":
+        from ducklake_core.simple_pipeline import validate_simple_pipeline
+        from ducklake_core.simple_pipeline import ensure_core_tables, create_lake_views
+        ensure_core_tables(conn)
+        # Recreate lake views to ensure validation reflects current parquet state
+        try:
+            create_lake_views(conn)
+        except Exception:
+            pass
+        v = validate_simple_pipeline(conn)
+        print(json.dumps({'validation': v}, indent=2, default=str))
+        return
+
+    if args.cmd == "reports-only":
+        create_report_views(conn)
+        run_reports_sql(conn)
+        return
+
+    if args.cmd == "ingest-today-searches":
+        base = pathlib.Path(args.path)
+        if not base.exists():
+            print(f"Path not found: {base}")
+            return
+        today = date.today().strftime('%Y-%m-%d')
+        candidates = list(base.glob(f"*{today}*.csv"))
+        added = 0
+        for f in candidates:
+            try:
+                ingest_bronze('search_logs', str(f), 'csv', dt_override=today)
+                added += 1
+            except Exception as e:
+                print(f"Failed to ingest {f}: {e}")
+        print(f"Ingested {added} today search CSV files (dt={today})")
+        return
+
+    if args.cmd == "simple-refresh":
+        from ducklake_core.simple_pipeline import simple_refresh
+        res = simple_refresh(conn)
+        print(json.dumps(res, indent=2, default=str))
+        print("Simple refresh complete.")
+        return
+
+    if args.cmd == "bootstrap-raw":
+        from ducklake_core.simple_pipeline import bootstrap_raw_from_silver
+        res = bootstrap_raw_from_silver(conn, overwrite=False, verbose=True)
+        print(json.dumps({"bootstrapped": res}, indent=2, default=str))
+        return
+
+    if args.cmd == "fast-bootstrap-lake":
+        from ducklake_core.simple_pipeline import fast_bootstrap_lake_from_silver
+        res = fast_bootstrap_lake_from_silver(conn, overwrite=bool(getattr(args,'overwrite', False)), verbose=True)
+        print(json.dumps({"fast_bootstrapped": res}, indent=2, default=str))
+        return
 
     if args.cmd == "ingest-file":
         fmt = args.format or pathlib.Path(args.path).suffix.lstrip(".")
@@ -657,6 +781,7 @@ def cli():
         build_silver_from_manifest(args.source, ((cfg or {}).get(args.source, {})))
         build_gold_content_rollups(args.source, title_col=args.title_col, value_col=args.value_col, agg=args.agg)
     elif args.cmd == "refresh":
+        pipeline_start = time.time()
         # Group tasks by layer
         bronze_tasks = []
         silver_tasks = []
@@ -723,15 +848,46 @@ def cli():
                     print_subtask_status(sub_name, "fail")
                     logger.error(f"Task failed: Gold/{src_name}/{sub_name}: {e}")
         print_main_task("Reports")
+        timings = {}
         for sub_name, fn in reports_tasks:
             print_subtask_status(sub_name, None)
             try:
+                _t0 = time.time()
                 fn()
+                _dt = time.time() - _t0
+                print(f"      (took {_dt:.2f}s)")
+                timings[sub_name] = _dt
                 print_subtask_status(sub_name, "ok")
             except Exception as e:
                 print_subtask_status(sub_name, "fail")
                 logger.error(f"Task failed: Reports/{sub_name}: {e}")
         print("\nPipeline complete.")
+        # Summary JSON
+        try:
+            searches_today = conn.execute("SELECT COUNT(*) FROM silver_search_logs WHERE date(timestamp)=current_date").fetchone()[0]
+        except Exception:
+            searches_today = None
+        try:
+            pages_today = conn.execute("SELECT COUNT(*) FROM silver_page_count WHERE dt=current_date").fetchone()[0]
+        except Exception:
+            pages_today = None
+        summary = {
+            "generated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            "timings_sec": timings,
+            "duration_sec": round(time.time()-pipeline_start,2),
+            "row_counts": {
+                "silver_page_count": conn.execute("SELECT COUNT(*) FROM silver_page_count").fetchone()[0] if True else None,
+                "silver_search_logs": conn.execute("SELECT COUNT(*) FROM silver_search_logs").fetchone()[0] if True else None,
+                "searches_today": searches_today,
+                "pages_today": pages_today,
+            }
+        }
+        outp = ROOT / 'reports' / 'refresh_summary.json'
+        try:
+            outp.write_text(json.dumps(summary, indent=2))
+            print(f"Wrote summary {outp}")
+        except Exception as e:
+            print(f"Failed to write summary: {e}")
         return
     # After building all sources, (re)create report views
     create_report_views(conn)
