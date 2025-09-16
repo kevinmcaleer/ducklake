@@ -119,21 +119,16 @@ def ingest_new_files(conn: duckdb.DuckDBPyConnection):
     part_dir = LAKE_DIR / source
     part_dir.mkdir(parents=True, exist_ok=True)
     parquet_path = part_dir / f"dt={dt_obj}.parquet"
-    # If file already exists, append by reading existing + new (for simplicity rewrite)
-    # Load CSV
     try:
-      # Load into DuckDB ephemeral table then write (append via UNION ALL + DISTINCT if duplicates risk)
-      df = conn.execute(f"SELECT * FROM read_csv_auto('{path}')").df()
       if parquet_path.exists():
-        # Read existing parquet, union, drop exact duplicates
-        existing = conn.execute(f"SELECT * FROM read_parquet('{parquet_path}')").df()
-        import pandas as pd
-        combined = pd.concat([existing, df], ignore_index=True).drop_duplicates()
-        # Overwrite
-        conn.execute(f"COPY (SELECT * FROM combined) TO '{parquet_path}' (FORMAT PARQUET)")
+        # Pure SQL union (no pandas) - assumes identical columns; duplicates kept (can add DISTINCT if needed)
+        conn.execute(f"COPY ((SELECT * FROM read_parquet('{parquet_path}')) UNION ALL (SELECT * FROM read_csv_auto('{path}'))) TO '{parquet_path}' (FORMAT PARQUET)")
+        # Row count from new file
+        added_rows = conn.execute(f"SELECT COUNT(*) FROM read_csv_auto('{path}')").fetchone()[0]
       else:
         conn.execute(f"COPY (SELECT * FROM read_csv_auto('{path}')) TO '{parquet_path}' (FORMAT PARQUET)")
-      conn.execute("INSERT INTO processed_files VALUES (?,?,?,?,?,current_timestamp)", [source, dt_obj, str(path), fid, len(df)])
+        added_rows = conn.execute(f"SELECT COUNT(*) FROM read_csv_auto('{path}')").fetchone()[0]
+      conn.execute("INSERT INTO processed_files VALUES (?,?,?,?,?,current_timestamp)", [source, dt_obj, str(path), fid, added_rows])
       new += 1
     except Exception as e:
       print(f"Failed ingest {path}: {e}", file=sys.stderr)
@@ -270,6 +265,19 @@ def simple_refresh(conn: duckdb.DuckDBPyConnection):
     'anomalies': {k: len(v.get('anomalies', [])) for k,v in anomalies.get('series', {}).items() if isinstance(v, dict) and 'anomalies' in v},
     'timings': phases,
   }
+
+def fast_load_single_day_csv(conn: duckdb.DuckDBPyConnection, source: str, csv_path: str, dt: date):
+  """Fast path: load a single CSV directly into its parquet partition (overwrite) without processed_files checks.
+
+  Useful when source raw data actually arrives as one (or two) consolidated files per day instead of many shards.
+  """
+  part_dir = LAKE_DIR / source
+  part_dir.mkdir(parents=True, exist_ok=True)
+  parquet_path = part_dir / f"dt={dt}.parquet"
+  conn.execute(f"COPY (SELECT * FROM read_csv_auto('{csv_path}')) TO '{parquet_path}' (FORMAT PARQUET, ALLOW_OVERWRITE TRUE)")
+  # Minimal processed_files insertion (hashless placeholder using path only)
+  fid = hashlib.sha256(f"{csv_path}:{dt}".encode()).hexdigest()
+  conn.execute("INSERT OR REPLACE INTO processed_files VALUES (?,?,?,?,?,current_timestamp)", [source, dt, csv_path, fid, conn.execute(f"SELECT COUNT(*) FROM read_csv_auto('{csv_path}')").fetchone()[0]])
 
 
 def bootstrap_raw_from_silver(conn: duckdb.DuckDBPyConnection, overwrite: bool = False, verbose: bool = True) -> dict:
