@@ -21,6 +21,42 @@ geoip_searches_by_country.sql # Example: search logs by country
 
 ## Workflow
 
+### Simplified Pipeline (New)
+
+For append-only daily sources (`page_count`, `search_logs`) a faster minimal path is available:
+
+```
+raw CSV  ->  lake parquet (one dt=YYYY-MM-DD.parquet per source/day)  -> daily aggregates  -> reports/*.csv
+```
+
+Artifacts:
+- `data/raw/<source>/dt=YYYY-MM-DD/*.csv` (ingestion inputs)
+- `data/lake/<source>/dt=YYYY-MM-DD.parquet` (columnar partitions)
+- Tables: `page_views_daily`, `searches_daily`
+- Views: `lake_page_count`, `lake_search_logs`
+- Reports + summaries: `reports/*.csv`, `reports/simple_refresh_summary.json`, `reports/anomalies.json`
+
+Commands:
+```bash
+python intake.py bootstrap-raw        # one-time export from existing silver tables
+python intake.py simple-refresh       # ingest new raw -> parquet -> aggregates -> reports
+python intake.py simple-validate      # validation only (no ingestion)
+python intake.py fast-bootstrap-lake  # direct parquet export from silver (faster historical seed)
+```
+
+Makefile shortcuts:
+```bash
+make simple-refresh
+make validate
+make bootstrap-raw
+make fast-bootstrap-lake
+make cleanup-manifest
+```
+
+Performance: target <5s incremental; timings + anomaly detection included in output JSON.
+
+Migration: run legacy `refresh` alongside simplified mode until validated (see `design/simplified_pipeline.md`).
+
 ### 1. Activate the venv
 
 ```bash
