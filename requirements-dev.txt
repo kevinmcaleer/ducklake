@@ -1,1 +1,6 @@
 pytest>=8.2
+duckdb
+pyyaml
+tqdm
+colorama
+requests

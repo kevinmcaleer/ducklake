@@ -11,6 +11,7 @@ Sources handled initially: page_count, search_logs.
 from __future__ import annotations
 import duckdb, pathlib, hashlib, time, json, sys
 from datetime import datetime, date
+from .anomaly import detect_anomalies
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RAW_DIR = ROOT / 'data' / 'raw'
@@ -257,6 +258,8 @@ def simple_refresh(conn: duckdb.DuckDBPyConnection):
   p0 = time.time(); run_simple_reports(conn); phases['reports_s'] = round(time.time()-p0, 3)
   # Validation
   p0 = time.time(); validate = validate_simple_pipeline(conn); phases['validation_s'] = round(time.time()-p0, 3)
+  # Anomaly detection (does not modify state)
+  p0 = time.time(); anomalies = detect_anomalies(conn); phases['anomaly_s'] = round(time.time()-p0, 3)
   total = round(time.time() - t0, 3)
   phases['total_s'] = total
   return {
@@ -264,6 +267,7 @@ def simple_refresh(conn: duckdb.DuckDBPyConnection):
     'latest_page_dt': conn.execute("SELECT max(dt) FROM page_views_daily").fetchone()[0],
     'latest_search_dt': conn.execute("SELECT max(dt) FROM searches_daily").fetchone()[0],
     'validation': validate,
+    'anomalies': {k: len(v.get('anomalies', [])) for k,v in anomalies.get('series', {}).items() if isinstance(v, dict) and 'anomalies' in v},
     'timings': phases,
   }
 
