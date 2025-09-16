@@ -574,6 +574,11 @@ def cli():
     sub.add_parser("bootstrap-raw", help="Export existing silver tables into data/raw/<source>/dt=*/ CSV layout")
     p_fast = sub.add_parser("fast-bootstrap-lake", help="Directly export silver tables into data/lake/<source>/dt=*.parquet")
     p_fast.add_argument('--overwrite', action='store_true', help='Overwrite existing partitions')
+    p_incr = sub.add_parser("incremental-snapshot", help="Ingest new rows from a cumulative snapshot CSV into daily parquet partitions")
+    p_incr.add_argument('source', help='Logical source name (e.g. page_count, search_logs)')
+    p_incr.add_argument('path', help='Path to snapshot CSV file')
+    p_incr.add_argument('--time-col', default='timestamp', help='Timestamp column name (default: timestamp)')
+    p_incr.add_argument('--no-quality', action='store_true', help='Disable quality filters (keep null/empty rows)')
 
     args = parser.parse_args()
     ensure_dirs()
@@ -656,6 +661,18 @@ def cli():
         from ducklake_core.simple_pipeline import fast_bootstrap_lake_from_silver
         res = fast_bootstrap_lake_from_silver(conn, overwrite=bool(getattr(args,'overwrite', False)), verbose=True)
         print(json.dumps({"fast_bootstrapped": res}, indent=2, default=str))
+        return
+
+    if args.cmd == "incremental-snapshot":
+        from ducklake_core.simple_pipeline import incremental_snapshot_ingest, create_lake_views, update_daily_aggregates, run_simple_reports, validate_simple_pipeline, ensure_core_tables
+        ensure_core_tables(conn)
+        res = incremental_snapshot_ingest(conn, args.source, args.path, time_col=args.time_col, quality=(not args.no_quality))
+        # Rebuild lake views + aggregates + reports to reflect new data (fast for limited new rows)
+        create_lake_views(conn)
+        update_daily_aggregates(conn)
+        run_simple_reports(conn)
+        validation = validate_simple_pipeline(conn)
+        print(json.dumps({'incremental': res, 'validation': validation}, indent=2, default=str))
         return
 
     if args.cmd == "ingest-file":

@@ -68,6 +68,8 @@ def ensure_core_tables(conn: duckdb.DuckDBPyConnection):
   conn.execute("CREATE TABLE IF NOT EXISTS page_views_daily (dt DATE PRIMARY KEY, views BIGINT, uniq_ips BIGINT)")
   # Allow NULL query temporarily (filter out during aggregation) by not enforcing NOT NULL constraint
   conn.execute("CREATE TABLE IF NOT EXISTS searches_daily (dt DATE, query TEXT, cnt BIGINT, PRIMARY KEY (dt, query))")
+  # High-water mark per source for snapshot-style incremental ingestion
+  conn.execute("CREATE TABLE IF NOT EXISTS ingestion_state (source TEXT PRIMARY KEY, last_ts TIMESTAMP)")
   # Performance indexes (DuckDB will treat these as projections in newer versions)
   try:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_searches_daily_dt ON searches_daily(dt)")
@@ -278,6 +280,55 @@ def fast_load_single_day_csv(conn: duckdb.DuckDBPyConnection, source: str, csv_p
   # Minimal processed_files insertion (hashless placeholder using path only)
   fid = hashlib.sha256(f"{csv_path}:{dt}".encode()).hexdigest()
   conn.execute("INSERT OR REPLACE INTO processed_files VALUES (?,?,?,?,?,current_timestamp)", [source, dt, csv_path, fid, conn.execute(f"SELECT COUNT(*) FROM read_csv_auto('{csv_path}')").fetchone()[0]])
+
+def incremental_snapshot_ingest(conn: duckdb.DuckDBPyConnection, source: str, snapshot_path: str, time_col: str = 'timestamp', quality: bool = True) -> dict:
+  """Incrementally ingest new rows from a cumulative snapshot CSV into per-day parquet partitions.
+
+  - Uses ingestion_state.last_ts as high-water mark.
+  - Filters to rows where time_col > last_ts.
+  - Derives dt = date(time_col) and overwrites/creates dt=YYYY-MM-DD.parquet for affected days only.
+  - Applies basic quality filters (timestamp not null, query non-empty) when source == 'search_logs'.
+  """
+  ensure_core_tables(conn)
+  last_ts = conn.execute("SELECT last_ts FROM ingestion_state WHERE source=?", [source]).fetchone()
+  last_ts_val = last_ts[0] if last_ts else None
+  base_read = f"read_csv_auto('{snapshot_path}')"
+  # Probe for column existence
+  cols = [r[0] for r in conn.execute(f"DESCRIBE {base_read}").fetchall()]
+  if time_col not in cols:
+    raise ValueError(f"Column '{time_col}' not found in snapshot {snapshot_path}")
+  quality_clause = ""
+  if quality and source == 'search_logs':
+    # Expect 'query' column
+    if 'query' in cols:
+      quality_clause = " AND query IS NOT NULL AND length(trim(query))>0"
+  time_filter = f"{time_col} IS NOT NULL" + (f" AND {time_col} > '{last_ts_val}'" if last_ts_val else "")
+  new_rows_view = f"SELECT *, date({time_col}) AS dt FROM {base_read} WHERE {time_filter}{quality_clause}"
+  # Materialize candidate new rows into temp view for reuse
+  try:
+    conn.execute("CREATE OR REPLACE TEMP VIEW _snapshot_new_rows AS " + new_rows_view)
+  except Exception as e:
+    raise RuntimeError(f"Failed to stage new rows: {e}")
+  new_count = conn.execute("SELECT COUNT(*) FROM _snapshot_new_rows").fetchone()[0]
+  if new_count == 0:
+    return {'new_rows': 0, 'updated_days': 0, 'last_ts': last_ts_val}
+  # Distinct days affected
+  days = [r[0] for r in conn.execute("SELECT DISTINCT dt FROM _snapshot_new_rows ORDER BY 1").fetchall()]
+  part_dir = LAKE_DIR / source
+  part_dir.mkdir(parents=True, exist_ok=True)
+  updated = 0
+  for dtv in days:
+    parquet_path = part_dir / f"dt={dtv}.parquet"
+    # Overwrite just that day's partition with union (existing + new for that day) -> DISTINCT optional
+    if parquet_path.exists():
+      conn.execute(f"COPY ((SELECT * FROM read_parquet('{parquet_path}')) UNION ALL (SELECT * FROM _snapshot_new_rows WHERE dt='{dtv}')) TO '{parquet_path}' (FORMAT PARQUET, ALLOW_OVERWRITE TRUE)")
+    else:
+      conn.execute(f"COPY (SELECT * FROM _snapshot_new_rows WHERE dt='{dtv}') TO '{parquet_path}' (FORMAT PARQUET)")
+    updated += 1
+  # Advance high-water mark
+  max_ts = conn.execute(f"SELECT max({time_col}) FROM _snapshot_new_rows").fetchone()[0]
+  conn.execute("INSERT OR REPLACE INTO ingestion_state VALUES (?, ?)", [source, max_ts])
+  return {'new_rows': new_count, 'updated_days': updated, 'last_ts': max_ts}
 
 
 def bootstrap_raw_from_silver(conn: duckdb.DuckDBPyConnection, overwrite: bool = False, verbose: bool = True) -> dict:
