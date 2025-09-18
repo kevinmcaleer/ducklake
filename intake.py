@@ -574,6 +574,15 @@ def cli():
     sub.add_parser("bootstrap-raw", help="Export existing silver tables into data/raw/<source>/dt=*/ CSV layout")
     p_fast = sub.add_parser("fast-bootstrap-lake", help="Directly export silver tables into data/lake/<source>/dt=*.parquet")
     p_fast.add_argument('--overwrite', action='store_true', help='Overwrite existing partitions')
+
+    # Full rebuild from latest all-visits CSV
+    p_full = sub.add_parser("full-rebuild-from-snapshot", help="Rebuild all lake partitions and aggregates from latest all-visits CSV (overwrites everything)")
+    p_full.add_argument('--csv', default=None, help='Path to all-visits-YYYY-MM-DD.csv (default: latest in _tmp_downloads)')
+    # Helper: stage daily downloads in _tmp_downloads into data/raw/<source>/dt=YYYY-MM-DD/
+    p_stage = sub.add_parser("stage-downloads", help="Copy _tmp_downloads/all-visits-*.csv into data/raw/<source>/dt=YYYY-MM-DD/")
+    p_stage.add_argument('--source', default='page_count', help='Logical source name (default: page_count)')
+    p_stage.add_argument('--pattern', default='all-visits-*.csv', help='Glob pattern in _tmp_downloads (default: all-visits-*.csv)')
+    p_stage.add_argument('--overwrite', action='store_true', help='Overwrite existing files in data/raw (default: skip)')
     p_incr = sub.add_parser("incremental-snapshot", help="Ingest new rows from a cumulative snapshot CSV into daily parquet partitions")
     p_incr.add_argument('source', help='Logical source name (e.g. page_count, search_logs)')
     p_incr.add_argument('path', help='Path to snapshot CSV file')
@@ -657,10 +666,87 @@ def cli():
         print(json.dumps({"bootstrapped": res}, indent=2, default=str))
         return
 
-    if args.cmd == "fast-bootstrap-lake":
-        from ducklake_core.simple_pipeline import fast_bootstrap_lake_from_silver
-        res = fast_bootstrap_lake_from_silver(conn, overwrite=bool(getattr(args,'overwrite', False)), verbose=True)
-        print(json.dumps({"fast_bootstrapped": res}, indent=2, default=str))
+
+    if args.cmd == "full-rebuild-from-snapshot":
+        # Find latest all-visits-*.csv if not provided
+        import pathlib, re
+        csv_path = args.csv
+        if not csv_path:
+            dl_dir = ROOT / "_tmp_downloads"
+            files = sorted(dl_dir.glob("all-visits-*.csv"))
+            if not files:
+                print("No all-visits-*.csv found in _tmp_downloads")
+                return
+            # Pick the latest by date in filename
+            rx = re.compile(r"all-visits-(\d{4}-\d{2}-\d{2})\\.csv$")
+            dated = [(f, rx.search(f.name)) for f in files]
+            dated = [(f, m.group(1)) for f, m in dated if m]
+            if not dated:
+                print("No dated all-visits-*.csv found")
+                return
+            csv_path, latest_dt = max(dated, key=lambda x: x[1])
+            csv_path = str(csv_path)
+        else:
+            latest_dt = None
+        print(f"Full rebuild from snapshot: {csv_path}")
+        # Remove all lake partitions for page_count
+        lake_dir = ROOT / "data" / "lake" / "page_count"
+        if lake_dir.exists():
+            for p in lake_dir.glob("dt=*.parquet"):
+                p.unlink(missing_ok=True)
+        # Remove all processed_files for page_count
+        conn.execute("DELETE FROM processed_files WHERE source='page_count'")
+        # Read all rows, partition by date(timestamp)
+        import duckdb
+        con = duckdb.connect(DB)
+        # Write all partitions in one COPY with PARTITION_BY for efficiency
+        con.execute(f"COPY (SELECT *, date(timestamp) AS dt FROM read_csv_auto('{csv_path}')) TO '{lake_dir}' (FORMAT PARQUET, PARTITION_BY (dt), OVERWRITE 1)")
+        # Count partitions written
+        dts = [r[0] for r in con.execute(f"SELECT DISTINCT date(timestamp) FROM read_csv_auto('{csv_path}') ORDER BY 1").fetchall()]
+        print(f"Wrote {len(dts)} partitions to {lake_dir}")
+        # Rebuild views and aggregates
+        from ducklake_core.simple_pipeline import create_lake_views, update_daily_aggregates, run_simple_reports, validate_simple_pipeline
+        create_lake_views(con)
+        update_daily_aggregates(con)
+        run_simple_reports(con)
+        validation = validate_simple_pipeline(con)
+        print(json.dumps({"rebuild": True, "partitions": len(dts), "validation": validation}, indent=2, default=str))
+        return
+
+    if args.cmd == "stage-downloads":
+        # Copy daily CSVs from _tmp_downloads into data/raw/<source>/dt=YYYY-MM-DD/
+        base_dl = ROOT / "_tmp_downloads"
+        if not base_dl.exists():
+            print(f"Download dir not found: {base_dl}")
+            return
+        import re as _re
+        pat = args.pattern
+        files = sorted(base_dl.glob(pat))
+        if not files:
+            print(f"No files matching {pat} in {base_dl}")
+            return
+        rx = _re.compile(r"all-visits-(\d{4}-\d{2}-\d{2})\.csv$")
+        staged = 0
+        skipped = 0
+        for f in files:
+            m = rx.search(f.name)
+            if not m:
+                skipped += 1
+                continue
+            dtv = m.group(1)
+            out_dir = ROOT / "data" / "raw" / args.source / f"dt={dtv}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dest = out_dir / f.name
+            try:
+                if dest.exists() and not args.overwrite:
+                    skipped += 1
+                    continue
+                # Copy preserving metadata when overwriting as well
+                shutil.copy2(str(f), str(dest))
+                staged += 1
+            except Exception as e:
+                print(f"Failed staging {f} -> {dest}: {e}")
+        print(json.dumps({"staged": staged, "skipped": skipped, "pattern": pat, "source": args.source}, indent=2))
         return
 
     if args.cmd == "incremental-snapshot":

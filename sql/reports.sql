@@ -1,37 +1,41 @@
+-- Searches today (derive date from timestamp to avoid relying on dt partition freshness)
 COPY (
   SELECT DISTINCT
-    dt,
+    date(timestamp) AS dt,
     timestamp,
     ip,
     query
   FROM silver_search_logs
-  WHERE dt = current_date
+  WHERE date(timestamp) = current_date
   ORDER BY timestamp
-) TO 'reports/searches_today.csv' (HEADER, DELIMITER ',');
+) TO 'reports/searches_today.csv' (FORMAT CSV, HEADER TRUE);
+
+-- Searches today totals (single row)
+COPY (
+  SELECT COUNT(*) AS searches_today
+  FROM silver_search_logs
+  WHERE date(timestamp) = current_date
+) TO 'reports/searches_today_totals.csv' (FORMAT CSV, HEADER TRUE);
 
 COPY (
-  WITH daily_visits AS (
-    SELECT dt, count(*) AS visits
-    FROM silver_page_count
-    GROUP BY dt
+  WITH visits AS (
+    SELECT dt, views AS visits FROM rl_page_views_daily
   ),
-  daily_searches AS (
-    SELECT dt, count(*) AS searches
-    FROM silver_search_logs
-    GROUP BY dt
+  search_totals AS (
+    SELECT dt, SUM(cnt) AS searches FROM rl_searches_daily GROUP BY dt
   ),
   all_days AS (
-    SELECT dt FROM daily_visits
+    SELECT dt FROM visits
     UNION
-    SELECT dt FROM daily_searches
+    SELECT dt FROM search_totals
   ),
   joined AS (
-    SELECT d.dt,
-           COALESCE(v.visits, 0) AS visits,
-           COALESCE(s.searches, 0) AS searches
-    FROM all_days d
-    LEFT JOIN daily_visits v ON d.dt = v.dt
-    LEFT JOIN daily_searches s ON d.dt = s.dt
+    SELECT a.dt,
+           COALESCE(v.visits,0) AS visits,
+           COALESCE(s.searches,0) AS searches
+    FROM all_days a
+    LEFT JOIN visits v ON a.dt = v.dt
+    LEFT JOIN search_totals s ON a.dt = s.dt
   )
   SELECT strftime(dt, '%w') AS dow_num,
          CASE strftime(dt, '%w')
@@ -43,8 +47,8 @@ COPY (
            WHEN '5' THEN 'Fri'
            WHEN '6' THEN 'Sat'
          END AS dow,
-         sum(visits) AS visits,
-         sum(searches) AS searches
+         SUM(visits) AS visits,
+         SUM(searches) AS searches
   FROM joined
   GROUP BY dow_num, dow
   ORDER BY dow_num
@@ -81,16 +85,16 @@ COPY (
     ) AS t(hour_utc)
   ),
   visits AS (
-    SELECT strftime(COALESCE(ts, timestamp), '%H') AS hour_utc, count(*) AS visits
-    FROM silver_page_count
+    SELECT hour_utc, SUM(views) AS visits
+    FROM rl_page_views_hourly
     GROUP BY 1
   ),
   searches AS (
-    SELECT strftime(COALESCE(ts, timestamp), '%H') AS hour_utc, count(*) AS searches
-    FROM silver_search_logs
+    SELECT hour_utc, SUM(searches) AS searches
+    FROM rl_searches_hourly
     GROUP BY 1
   )
-  SELECT h.hour_utc, COALESCE(v.visits, 0) AS visits, COALESCE(s.searches, 0) AS searches
+  SELECT h.hour_utc, COALESCE(v.visits,0) AS visits, COALESCE(s.searches,0) AS searches
   FROM hours h
   LEFT JOIN visits v ON h.hour_utc = v.hour_utc
   LEFT JOIN searches s ON h.hour_utc = s.hour_utc
@@ -107,42 +111,36 @@ COPY (
 ) TO 'reports/popular_ip_prefix24.csv' (FORMAT CSV, HEADER TRUE);
 -- 5) Visits per day/week/month (pages)
 COPY (
-  SELECT dt, count(*) AS cnt
-  FROM silver_page_count
+  SELECT dt, SUM(views) AS cnt
+  FROM rl_page_views_daily
   GROUP BY 1
   ORDER BY 1
 ) TO 'reports/visits_pages_daily.csv' (FORMAT CSV, HEADER TRUE);
 
 COPY (
-  SELECT strftime(dt, '%G-%V') AS iso_week, count(*) AS cnt
-  FROM silver_page_count
+  SELECT strftime(dt, '%G-%V') AS iso_week, SUM(views) AS cnt
+  FROM rl_page_views_daily
   GROUP BY 1
   ORDER BY 1
 ) TO 'reports/visits_pages_weekly.csv' (FORMAT CSV, HEADER TRUE);
 
 COPY (
-  SELECT strftime(dt, '%Y-%m') AS yyyymm, count(*) AS cnt
-  FROM silver_page_count
+  SELECT strftime(dt, '%Y-%m') AS yyyymm, SUM(views) AS cnt
+  FROM rl_page_views_daily
   GROUP BY 1
   ORDER BY 1
 ) TO 'reports/visits_pages_monthly.csv' (FORMAT CSV, HEADER TRUE);
 -- Searches per day by query (so you can see what the searches are)
 COPY (
-  SELECT dt, lower(query) AS query, count(*) AS cnt
-  FROM silver_search_logs
-  GROUP BY 1, 2
+  SELECT dt, query, cnt
+  FROM rl_searches_daily
   ORDER BY dt, cnt DESC
 ) TO 'reports/searches_daily.csv' (FORMAT CSV, HEADER TRUE);
 -- 6) Week-over-week trend (pages)
 COPY (
-WITH daily AS (
-  SELECT dt, count(*) AS cnt
-  FROM silver_page_count
-  GROUP BY 1
-),
-wk AS (
-  SELECT strftime(dt, '%G-%V') AS iso_week, sum(cnt) AS week_cnt
-  FROM daily
+WITH wk AS (
+  SELECT strftime(dt, '%G-%V') AS iso_week, SUM(views) AS week_cnt
+  FROM rl_page_views_daily
   GROUP BY 1
 )
 SELECT w1.iso_week, w1.week_cnt,
@@ -183,13 +181,4 @@ ORDER BY views ASC, uniq_visitors ASC
 LIMIT 100
 ) TO 'reports/engagement_least.csv' (FORMAT CSV, HEADER TRUE);
 
-COPY (
-  SELECT DISTINCT
-    dt,
-    timestamp,
-    ip,
-    query
-  FROM silver_search_logs
-  WHERE dt = current_date
-  ORDER BY timestamp
-) TO 'reports/searches_today.csv' (HEADER, DELIMITER ',');
+-- (Removed duplicate searches_today block at file end; consolidated at top)

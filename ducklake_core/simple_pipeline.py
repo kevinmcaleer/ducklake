@@ -22,6 +22,35 @@ SOURCES = ['page_count', 'search_logs']
 
 # Basic report SQL mapping (depends on aggregates)
 REPORT_QUERIES = {
+  'visits_pages_monthly.csv': """
+    SELECT strftime(dt, '%Y%m') AS yyyymm, sum(views) AS cnt
+    FROM page_views_daily
+    GROUP BY 1
+    ORDER BY 1
+  """,
+  'visits_pages_weekly.csv': """
+    SELECT strftime(dt, '%G-W%V') AS iso_week, sum(views) AS cnt
+    FROM page_views_daily
+    GROUP BY 1
+    ORDER BY 1
+  """,
+  'visits_pages_wow.csv': """
+    WITH weekly AS (
+      SELECT strftime(dt, '%G-W%V') AS iso_week, sum(views) AS week_cnt
+      FROM page_views_daily
+      GROUP BY 1
+    ),
+    wow AS (
+      SELECT iso_week, week_cnt,
+             lag(week_cnt) OVER (ORDER BY iso_week) AS prev_week,
+             week_cnt - lag(week_cnt) OVER (ORDER BY iso_week) AS delta,
+             CASE WHEN lag(week_cnt) OVER (ORDER BY iso_week) = 0 THEN NULL
+                  ELSE round(100.0 * (week_cnt - lag(week_cnt) OVER (ORDER BY iso_week)) / lag(week_cnt) OVER (ORDER BY iso_week), 2)
+             END AS pct_change
+      FROM weekly
+    )
+    SELECT iso_week, week_cnt, prev_week, delta, pct_change FROM wow ORDER BY iso_week
+  """,
   'busiest_days_of_week.csv': """
     SELECT strftime(dt, '%w') AS dow_num,
            CASE strftime(dt, '%w') WHEN '0' THEN 'Sun' WHEN '1' THEN 'Mon' WHEN '2' THEN 'Tue' WHEN '3' THEN 'Wed' WHEN '4' THEN 'Thu' WHEN '5' THEN 'Fri' WHEN '6' THEN 'Sat' END AS dow,
@@ -33,9 +62,9 @@ REPORT_QUERIES = {
   'busiest_hours_utc.csv': """
     SELECT hour_utc, sum(views) AS cnt
     FROM (
-      SELECT date_part('hour', COALESCE(ts, timestamp)) AS hour_utc, 1 AS views
+      SELECT date_part('hour', timestamp) AS hour_utc, 1 AS views
       FROM lake_page_count
-      WHERE COALESCE(ts, timestamp) IS NOT NULL
+      WHERE timestamp IS NOT NULL
     )
     GROUP BY 1 ORDER BY 1
   """,
@@ -123,9 +152,26 @@ def ingest_new_files(conn: duckdb.DuckDBPyConnection):
     parquet_path = part_dir / f"dt={dt_obj}.parquet"
     try:
       if parquet_path.exists():
-        # Pure SQL union (no pandas) - assumes identical columns; duplicates kept (can add DISTINCT if needed)
-        conn.execute(f"COPY ((SELECT * FROM read_parquet('{parquet_path}')) UNION ALL (SELECT * FROM read_csv_auto('{path}'))) TO '{parquet_path}' (FORMAT PARQUET)")
-        # Row count from new file
+        # Align schemas by projecting the same column list from both sides
+        existing_cols = [r[0] for r in conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{parquet_path}')").fetchall()]
+        csv_cols = [r[0] for r in conn.execute(f"DESCRIBE SELECT * FROM read_csv_auto('{path}')").fetchall()]
+        csv_set = set(csv_cols)
+        select_existing = ",".join(existing_cols)
+        select_new = ",".join([c if c in csv_set else f"NULL AS {c}" for c in existing_cols])
+        tmp_path = parquet_path.with_suffix('.parquet.tmp')
+        try:
+          if tmp_path.exists():
+            tmp_path.unlink()
+        except Exception:
+          pass
+        conn.execute(
+          f"COPY ((SELECT {select_existing} FROM read_parquet('{parquet_path}')) UNION ALL (SELECT {select_new} FROM read_csv_auto('{path}'))) TO '{tmp_path}' (FORMAT PARQUET)"
+        )
+        try:
+          parquet_path.unlink()
+          tmp_path.rename(parquet_path)
+        except Exception as e:
+          raise RuntimeError(f"Failed replacing parquet partition {parquet_path}: {e}")
         added_rows = conn.execute(f"SELECT COUNT(*) FROM read_csv_auto('{path}')").fetchone()[0]
       else:
         conn.execute(f"COPY (SELECT * FROM read_csv_auto('{path}')) TO '{parquet_path}' (FORMAT PARQUET)")
@@ -162,15 +208,34 @@ def update_daily_aggregates(conn: duckdb.DuckDBPyConnection):
   # Page views daily
   max_dt_row = conn.execute("SELECT COALESCE(max(dt), DATE '1970-01-01') FROM page_views_daily").fetchone()
   max_dt = max_dt_row[0]
-  conn.execute("""
-    INSERT OR REPLACE INTO page_views_daily
-    SELECT date(COALESCE(ts, timestamp)) AS dt,
-           count(*) AS views,
-           count(DISTINCT ip) AS uniq_ips
-    FROM lake_page_count
-    WHERE date(COALESCE(ts, timestamp)) > ?
-    GROUP BY 1
-  """, [max_dt])
+  # Always use COALESCE for all likely timestamp columns
+  try:
+    cols = [r[0] for r in conn.execute("DESCRIBE lake_page_count").fetchall()]
+  except Exception:
+    cols = [r[1] for r in conn.execute("PRAGMA table_info('lake_page_count')").fetchall()]
+  # Build COALESCE expression for all present timestamp columns
+  candidates = [c for c in ('timestamp', 'event_ts', 'time') if c in cols]
+  if candidates:
+    coalesce_expr = f"COALESCE({', '.join(candidates)})"
+    conn.execute(f"""
+      INSERT OR REPLACE INTO page_views_daily
+      SELECT date({coalesce_expr}) AS dt,
+             count(*) AS views,
+             count(DISTINCT ip) AS uniq_ips
+      FROM lake_page_count
+      WHERE {coalesce_expr} IS NOT NULL AND date({coalesce_expr}) > ?
+      GROUP BY 1
+    """, [max_dt])
+  elif 'dt' in cols:
+    conn.execute("""
+      INSERT OR REPLACE INTO page_views_daily
+      SELECT dt,
+             count(*) AS views,
+             count(DISTINCT ip) AS uniq_ips
+      FROM lake_page_count
+      WHERE dt > ?
+      GROUP BY 1
+    """, [max_dt])
   # Searches daily (dynamic column detection: prefer timestamp, else dt already present)
   # We'll rebuild searches for new days only; if logic changes to full rebuild set full_rebuild=True
   max_s_dt = conn.execute("SELECT COALESCE(max(dt), DATE '1970-01-01') FROM searches_daily").fetchone()[0]
@@ -181,7 +246,7 @@ def update_daily_aggregates(conn: duckdb.DuckDBPyConnection):
     # PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk)
     cols = [r[1] for r in conn.execute("PRAGMA table_info('lake_search_logs')").fetchall()]
   time_col = None
-  for candidate in ('timestamp', 'ts', 'event_ts'):
+  for candidate in ('timestamp', 'event_ts'):
     if candidate in cols:
       time_col = candidate
       break
@@ -276,7 +341,21 @@ def fast_load_single_day_csv(conn: duckdb.DuckDBPyConnection, source: str, csv_p
   part_dir = LAKE_DIR / source
   part_dir.mkdir(parents=True, exist_ok=True)
   parquet_path = part_dir / f"dt={dt}.parquet"
-  conn.execute(f"COPY (SELECT * FROM read_csv_auto('{csv_path}')) TO '{parquet_path}' (FORMAT PARQUET, ALLOW_OVERWRITE TRUE)")
+  # Write to temp then replace to avoid partial write issues
+  tmp_path = parquet_path.with_suffix('.parquet.tmp')
+  try:
+    if tmp_path.exists():
+      tmp_path.unlink()
+  except Exception:
+    pass
+  conn.execute(f"COPY (SELECT * FROM read_csv_auto('{csv_path}')) TO '{tmp_path}' (FORMAT PARQUET)")
+  # Replace original
+  try:
+    if parquet_path.exists():
+      parquet_path.unlink()
+    tmp_path.rename(parquet_path)
+  except Exception as e:
+    raise RuntimeError(f"Failed replacing parquet partition {parquet_path}: {e}")
   # Minimal processed_files insertion (hashless placeholder using path only)
   fid = hashlib.sha256(f"{csv_path}:{dt}".encode()).hexdigest()
   conn.execute("INSERT OR REPLACE INTO processed_files VALUES (?,?,?,?,?,current_timestamp)", [source, dt, csv_path, fid, conn.execute(f"SELECT COUNT(*) FROM read_csv_auto('{csv_path}')").fetchone()[0]])
@@ -294,7 +373,7 @@ def incremental_snapshot_ingest(conn: duckdb.DuckDBPyConnection, source: str, sn
   last_ts_val = last_ts[0] if last_ts else None
   base_read = f"read_csv_auto('{snapshot_path}')"
   # Probe for column existence
-  cols = [r[0] for r in conn.execute(f"DESCRIBE {base_read}").fetchall()]
+  cols = [r[0] for r in conn.execute(f"DESCRIBE SELECT * FROM {base_read}").fetchall()]
   if time_col not in cols:
     raise ValueError(f"Column '{time_col}' not found in snapshot {snapshot_path}")
   quality_clause = ""
@@ -303,7 +382,14 @@ def incremental_snapshot_ingest(conn: duckdb.DuckDBPyConnection, source: str, sn
     if 'query' in cols:
       quality_clause = " AND query IS NOT NULL AND length(trim(query))>0"
   time_filter = f"{time_col} IS NOT NULL" + (f" AND {time_col} > '{last_ts_val}'" if last_ts_val else "")
-  new_rows_view = f"SELECT *, date({time_col}) AS dt FROM {base_read} WHERE {time_filter}{quality_clause}"
+  # Build projection without creating duplicate dt if file already has dt column
+  has_dt_col = 'dt' in cols
+  select_cols = '*'
+  if has_dt_col:
+    # Remove existing dt and recompute to normalize type/date
+    non_dt_cols = [c for c in cols if c != 'dt']
+    select_cols = ",".join(non_dt_cols)
+  new_rows_view = f"SELECT {select_cols}, date({time_col}) AS dt FROM {base_read} WHERE {time_filter}{quality_clause}"
   # Materialize candidate new rows into temp view for reuse
   try:
     conn.execute("CREATE OR REPLACE TEMP VIEW _snapshot_new_rows AS " + new_rows_view)
@@ -321,7 +407,19 @@ def incremental_snapshot_ingest(conn: duckdb.DuckDBPyConnection, source: str, sn
     parquet_path = part_dir / f"dt={dtv}.parquet"
     # Overwrite just that day's partition with union (existing + new for that day) -> DISTINCT optional
     if parquet_path.exists():
-      conn.execute(f"COPY ((SELECT * FROM read_parquet('{parquet_path}')) UNION ALL (SELECT * FROM _snapshot_new_rows WHERE dt='{dtv}')) TO '{parquet_path}' (FORMAT PARQUET, ALLOW_OVERWRITE TRUE)")
+      tmp_path = parquet_path.with_suffix('.parquet.tmp')
+      try:
+        if tmp_path.exists():
+          tmp_path.unlink()
+      except Exception:
+        pass
+      # Union existing + new rows into tmp then atomically replace
+      conn.execute(f"COPY ((SELECT event_ts, ip, query, dt FROM read_parquet('{parquet_path}')) UNION ALL (SELECT event_ts, ip, query, dt FROM _snapshot_new_rows WHERE dt='{dtv}')) TO '{tmp_path}' (FORMAT PARQUET)")
+      try:
+        parquet_path.unlink()
+        tmp_path.rename(parquet_path)
+      except Exception as e:
+        raise RuntimeError(f"Failed updating partition {parquet_path}: {e}")
     else:
       conn.execute(f"COPY (SELECT * FROM _snapshot_new_rows WHERE dt='{dtv}') TO '{parquet_path}' (FORMAT PARQUET)")
     updated += 1

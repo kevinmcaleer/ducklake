@@ -11,7 +11,7 @@ import csv
 from datetime import datetime
 
 # Root directory containing nested log files
-dir_logs = 'bronze/source=search_logs/format=log/'
+dir_logs = '_tmp_downloads/'
 # Output directory for CSVs
 csv_dir = '_tmp_downloads/search_logs_csv/'
 os.makedirs(csv_dir, exist_ok=True)
