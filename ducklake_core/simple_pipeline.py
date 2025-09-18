@@ -85,14 +85,34 @@ REPORT_QUERIES = {
   """,
   'visits_pages_daily.csv': "SELECT dt, views AS cnt FROM page_views_daily ORDER BY dt",
   'searches_daily.csv': "SELECT dt, query, cnt FROM searches_daily ORDER BY dt, cnt DESC",
+  # Top queries (normalized: lowercase + trimmed + collapsed internal whitespace)
   'top_queries_all_time.csv': """
-    SELECT query, sum(cnt) AS cnt
-    FROM searches_daily
+    WITH norm AS (
+      SELECT lower(trim(regexp_replace(query, '\\s+', ' '))) AS query_norm, cnt
+      FROM searches_daily
+    )
+    SELECT query_norm AS query, sum(cnt) AS cnt
+    FROM norm
     GROUP BY 1 ORDER BY cnt DESC LIMIT 100
   """,
   'top_queries_30d.csv': """
-    SELECT query, sum(cnt) AS cnt
-    FROM searches_daily WHERE dt >= current_date - INTERVAL 30 DAY
+    WITH norm AS (
+      SELECT dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS query_norm, cnt
+      FROM searches_daily
+      WHERE dt >= current_date - INTERVAL 30 DAY
+    )
+    SELECT query_norm AS query, sum(cnt) AS cnt
+    FROM norm
+    GROUP BY 1 ORDER BY cnt DESC LIMIT 100
+  """,
+  'top_queries_7d.csv': """
+    WITH norm AS (
+      SELECT dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS query_norm, cnt
+      FROM searches_daily
+      WHERE dt >= current_date - INTERVAL 7 DAY
+    )
+    SELECT query_norm AS query, sum(cnt) AS cnt
+    FROM norm
     GROUP BY 1 ORDER BY cnt DESC LIMIT 100
   """,
   'searches_summary.csv': """
