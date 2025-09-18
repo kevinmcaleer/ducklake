@@ -31,6 +31,7 @@ from ducklake_core.simple_pipeline import (
     RAW_DIR,
     REPORTS_DIR,
 )
+from ducklake_core.fetch_raw import fetch_page_count_recent, fetch_search_logs_snapshot, fetch_page_count_all, fetch_search_logs_file
 
 
 def _connect(path: str):
@@ -193,6 +194,45 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fetch(args: argparse.Namespace) -> int:
+    results = {}
+    if 'page_count' in args.sources or 'all' in args.sources:
+        results['page_count'] = fetch_page_count_recent(args.days, overwrite=args.overwrite, base_url=args.page_count_url, api_key=args.page_count_key, fallback_dir=pathlib.Path(args.fallback_dir) if args.fallback_dir else None)
+    if 'search_logs' in args.sources or 'all' in args.sources:
+        results['search_logs'] = fetch_search_logs_snapshot(snapshot_url=args.search_logs_url, overwrite=args.overwrite, base_url=args.search_logs_url, api_key=args.search_logs_key)
+    if args.refresh:
+        # Run a refresh after fetching
+        con = _connect(args.db)
+        ref = simple_refresh(con)
+    else:
+        ref = None
+    payload = {'fetched': results, 'refresh': ref}
+    print(json.dumps(payload, indent=2, default=str) if args.json else payload)
+    return 0
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """Full historical backfill for page_count (and optionally search logs snapshot) then refresh.
+
+    Page count: attempts API full export (all=1) else consumes every local JSONL archive.
+    Search logs: if --search-logs-url provided we treat it as a full snapshot and ingest per-day.
+    """
+    results = {}
+    results['page_count'] = fetch_page_count_all(overwrite=args.overwrite, base_url=args.page_count_url, api_key=args.page_count_key, fallback_dir=pathlib.Path(args.fallback_dir) if args.fallback_dir else None)
+    if args.search_logs_url:
+        results['search_logs'] = fetch_search_logs_snapshot(snapshot_url=args.search_logs_url, overwrite=args.overwrite, base_url=args.search_logs_url, api_key=args.search_logs_key)
+    elif args.search_logs_file:
+        results['search_logs'] = fetch_search_logs_file(args.search_logs_file, overwrite=args.overwrite)
+    if not args.no_refresh:
+        con = _connect(args.db)
+        ref = simple_refresh(con)
+    else:
+        ref = None
+    payload = {'backfill': results, 'refresh': ref}
+    print(json.dumps(payload, indent=2, default=str) if args.json else payload)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Ducklake simple pipeline CLI")
     p.add_argument("--db", default="contentlake.ducklake", help="DuckDB database file path")
@@ -220,6 +260,33 @@ def build_parser() -> argparse.ArgumentParser:
     rp = sub.add_parser("reset", help="Remove DB file, lake, silver, reports (optionally raw) for a clean slate")
     rp.add_argument("--include-raw", action="store_true", help="Also delete data/raw directory")
     rp.set_defaults(func=cmd_reset)
+
+    # Subcommand: fetch (download raw then optional refresh)
+    fp = sub.add_parser("fetch", help="Fetch raw source data (recent/page_count, snapshot search logs) then optional refresh")
+    fp.add_argument("--sources", nargs="+", default=["all"], help="Sources to fetch: page_count search_logs all")
+    fp.add_argument("--days", type=int, default=1, help="Recent days to fetch for page_count")
+    fp.add_argument("--page-count-url", help="Override PAGE_COUNT_API_URL")
+    fp.add_argument("--page-count-key", help="API key for page_count endpoint")
+    fp.add_argument("--search-logs-url", help="Override SEARCH_LOGS_API_URL / snapshot URL")
+    fp.add_argument("--search-logs-key", help="API key for search_logs endpoint")
+    fp.add_argument("--fallback-dir", help="Fallback directory of local JSONL files (all-visits-*.jsonl)")
+    fp.add_argument("--overwrite", action="store_true", help="Overwrite existing raw CSV partitions for fetched days")
+    fp.add_argument("--refresh", action="store_true", help="Run pipeline refresh after fetch")
+    fp.add_argument("--json", action="store_true", help="JSON output (overrides top-level flag)")
+    fp.set_defaults(func=cmd_fetch)
+
+    # Subcommand: backfill (full historical for page_count + optional search logs snapshot)
+    bp = sub.add_parser("backfill", help="Full historical backfill for page_count (API all=1 or all local archives) and optional search logs snapshot")
+    bp.add_argument("--page-count-url", help="API base URL for page_count full export (will append all=1 if not present)")
+    bp.add_argument("--page-count-key", help="API key for page_count endpoint")
+    bp.add_argument("--search-logs-url", help="Full snapshot URL for search logs (JSON or JSONL)")
+    bp.add_argument("--search-logs-file", help="Local search logs file path (e.g. /Volumes/Search\\ Logs/Search-Logs.log)")
+    bp.add_argument("--search-logs-key", help="API key for search_logs endpoint")
+    bp.add_argument("--fallback-dir", help="Fallback directory of local JSONL files (all-visits-*.jsonl)")
+    bp.add_argument("--overwrite", action="store_true", help="Overwrite existing per-day raw CSV partitions")
+    bp.add_argument("--no-refresh", action="store_true", help="Skip running simple_refresh after backfill")
+    bp.add_argument("--json", action="store_true", help="JSON output (overrides top-level flag)")
+    bp.set_defaults(func=cmd_backfill)
 
     p.set_defaults(func=cmd_refresh)
     return p

@@ -355,14 +355,97 @@ def validate_simple_pipeline(conn: duckdb.DuckDBPyConnection) -> dict:
   return checks
 
 
+def _dynamic_busiest_hours_sql(conn: duckdb.DuckDBPyConnection):
+  # Determine an available time column in lake_page_count
+  try:
+    cols = [r[0] for r in conn.execute("DESCRIBE lake_page_count").fetchall()]
+  except Exception:
+    cols = []
+  for c in ('timestamp','event_ts','time'):
+    if c in cols:
+      return f"""
+        SELECT hour_utc, sum(views) AS cnt FROM (
+          SELECT date_part('hour', {c}) AS hour_utc, 1 AS views
+          FROM lake_page_count
+          WHERE {c} IS NOT NULL
+        ) GROUP BY 1 ORDER BY 1
+      """
+  return None
+
+
 def run_simple_reports(conn: duckdb.DuckDBPyConnection):
   REPORTS_DIR.mkdir(parents=True, exist_ok=True)
   out = {}
   for fname, sql in REPORT_QUERIES.items():
     target = REPORTS_DIR / fname
-    conn.execute(f"COPY ({sql}) TO '{target}' (HEADER TRUE, DELIMITER ',')")
-    rows = sum(1 for _ in target.open()) - 1 if target.exists() else 0
-    out[fname] = rows
+    effective_sql = sql
+    if fname == 'busiest_hours_utc.csv':
+      dyn = _dynamic_busiest_hours_sql(conn)
+      if dyn is None:
+        # Write empty header file and continue
+        target.write_text('hour_utc,cnt\n')
+        out[fname] = 0
+        continue
+      effective_sql = dyn
+    elif fname in ('searches_today.csv','searches_today_totals.csv'):
+      # Determine a usable time column for searches today reports
+      try:
+        cols = [r[0] for r in conn.execute("DESCRIBE lake_search_logs").fetchall()]
+      except Exception:
+        cols = []
+      time_col = None
+      for c in ('timestamp','event_ts','time','dt'):
+        if c in cols:
+          time_col = c
+          break
+      if time_col is None:
+        # emit empty files with headers
+        if fname == 'searches_today.csv':
+          target.write_text('dt,timestamp,ip,query\n')
+        else:
+          target.write_text('dt,raw_events,distinct_queries,aggregated_query_events,total_searches_all_time\n')
+        out[fname] = 0
+        continue
+      if fname == 'searches_today.csv':
+        effective_sql = f"""
+          SELECT date(l.{time_col}) AS dt, l.{time_col} AS timestamp, l.ip, lower(trim(l.query)) AS query
+          FROM lake_search_logs l
+          WHERE l.{time_col} IS NOT NULL
+            AND date(l.{time_col}) = current_date
+            AND l.query IS NOT NULL AND length(trim(l.query))>0
+          ORDER BY l.{time_col}
+        """
+      else:
+        effective_sql = f"""
+          WITH today AS (
+            SELECT date({time_col}) AS dt, lower(trim(query)) AS query
+            FROM lake_search_logs
+            WHERE {time_col} IS NOT NULL
+              AND date({time_col}) = current_date
+              AND query IS NOT NULL AND length(trim(query))>0
+          )
+          SELECT dt,
+                 COUNT(*) AS raw_events,
+                 COUNT(DISTINCT query) AS distinct_queries,
+                 (SELECT COALESCE(sum(cnt),0) FROM searches_daily WHERE dt = current_date) AS aggregated_query_events,
+                 (SELECT COALESCE(sum(cnt),0) FROM searches_daily) AS total_searches_all_time
+          FROM today
+          GROUP BY 1
+        """
+    try:
+      conn.execute(f"COPY ({effective_sql}) TO '{target}' (HEADER TRUE, DELIMITER ',')")
+      rows = sum(1 for _ in target.open()) - 1 if target.exists() else 0
+      out[fname] = rows
+    except Exception as e:
+      # Fallback: create empty CSV with generic header if possible
+      print(f"[WARN] report {fname} failed: {e}")
+      if not target.exists():
+        # naive header inference: if SELECT dt in sql choose dt,cnt else generic
+        if 'hour_utc' in sql:
+          target.write_text('hour_utc,cnt\n')
+        else:
+          target.write_text('col\n')
+      out[fname] = 0
   (REPORTS_DIR / 'simple_refresh_summary.json').write_text(json.dumps({'generated': out, 'ts': datetime.utcnow().isoformat()+'Z'}, indent=2))
 
 
@@ -436,9 +519,39 @@ def simple_refresh(conn: duckdb.DuckDBPyConnection):
         df.to_parquet(out_path, index=False)
         conn.execute(f"CREATE OR REPLACE VIEW silver_page_count AS SELECT * FROM read_parquet('{out_path}', union_by_name=true)")
       else:
-        conn.execute("CREATE OR REPLACE VIEW silver_page_count AS SELECT * FROM lake_page_count WHERE 0=1")
+        # Empty dataframe; create a zero-row view with expected enrichment columns present
+        conn.execute("""
+          CREATE OR REPLACE VIEW silver_page_count AS
+          SELECT *,
+            CAST(NULL AS VARCHAR) AS agent_type,
+            CAST(NULL AS VARCHAR) AS os,
+            CAST(NULL AS VARCHAR) AS os_version,
+            CAST(NULL AS VARCHAR) AS browser,
+            CAST(NULL AS VARCHAR) AS browser_version,
+            CAST(NULL AS VARCHAR) AS device,
+            CAST(NULL AS INTEGER) AS is_mobile,
+            CAST(NULL AS INTEGER) AS is_tablet,
+            CAST(NULL AS INTEGER) AS is_pc,
+            CAST(NULL AS INTEGER) AS is_bot
+          FROM lake_page_count WHERE 0=1
+        """)
     else:
-      conn.execute("CREATE OR REPLACE VIEW silver_page_count AS SELECT * FROM lake_page_count WHERE 0=1")
+      # No user_agent column; still expose expected enrichment columns (NULL) so reports don't break
+      conn.execute("""
+        CREATE OR REPLACE VIEW silver_page_count AS
+        SELECT *,
+          CAST(NULL AS VARCHAR) AS agent_type,
+          CAST(NULL AS VARCHAR) AS os,
+          CAST(NULL AS VARCHAR) AS os_version,
+          CAST(NULL AS VARCHAR) AS browser,
+          CAST(NULL AS VARCHAR) AS browser_version,
+          CAST(NULL AS VARCHAR) AS device,
+          CAST(NULL AS INTEGER) AS is_mobile,
+          CAST(NULL AS INTEGER) AS is_tablet,
+          CAST(NULL AS INTEGER) AS is_pc,
+          CAST(NULL AS INTEGER) AS is_bot
+        FROM lake_page_count WHERE 0=1
+      """)
   except Exception as e:
     print(f"[WARN] Silver enrichment failed: {e}")
   phases['silver_enrich_s'] = round(time.time()-p0, 3)
