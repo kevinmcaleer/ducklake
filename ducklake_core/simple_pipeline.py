@@ -93,6 +93,7 @@ REPORT_QUERIES = {
     )
     SELECT query_norm AS query, sum(cnt) AS cnt
     FROM norm
+    WHERE query_norm <> 'null'
     GROUP BY 1 ORDER BY cnt DESC LIMIT 100
   """,
   'top_queries_30d.csv': """
@@ -103,6 +104,7 @@ REPORT_QUERIES = {
     )
     SELECT query_norm AS query, sum(cnt) AS cnt
     FROM norm
+    WHERE query_norm <> 'null'
     GROUP BY 1 ORDER BY cnt DESC LIMIT 100
   """,
   'top_queries_7d.csv': """
@@ -113,6 +115,7 @@ REPORT_QUERIES = {
     )
     SELECT query_norm AS query, sum(cnt) AS cnt
     FROM norm
+    WHERE query_norm <> 'null'
     GROUP BY 1 ORDER BY cnt DESC LIMIT 100
   """,
   'searches_summary.csv': """
@@ -123,6 +126,33 @@ REPORT_QUERIES = {
   'searches_distinct_daily.csv': """
     SELECT dt, count(DISTINCT query) AS distinct_queries, sum(cnt) AS searches
     FROM searches_daily GROUP BY 1 ORDER BY 1
+  """,
+  'queries_quality.csv': """
+    WITH raw AS (
+      SELECT date(timestamp) AS dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS q
+      FROM lake_search_logs
+      WHERE timestamp IS NOT NULL AND query IS NOT NULL AND length(trim(query))>0
+    ), classified AS (
+      SELECT dt, q,
+             CASE
+               WHEN q IS NULL OR q='' THEN 'empty'
+               WHEN q='null' THEN 'literal_null'
+               WHEN length(q)=1 THEN 'single_char'
+               ELSE 'kept'
+             END AS quality
+      FROM raw
+    )
+    SELECT dt,
+           sum(CASE WHEN quality='kept' THEN 1 ELSE 0 END) AS kept_events,
+           sum(CASE WHEN quality!='kept' THEN 1 ELSE 0 END) AS excluded_events,
+           sum(CASE WHEN quality='literal_null' THEN 1 ELSE 0 END) AS literal_null_events,
+           sum(CASE WHEN quality='single_char' THEN 1 ELSE 0 END) AS single_char_events,
+           sum(CASE WHEN quality='empty' THEN 1 ELSE 0 END) AS empty_events,
+           COUNT(*) AS total_events,
+           round(100.0 * NULLIF(sum(CASE WHEN quality!='kept' THEN 1 ELSE 0 END),0) / NULLIF(COUNT(*),0),2) AS pct_excluded
+    FROM classified
+    GROUP BY 1
+    ORDER BY 1
   """,
   'searches_today.csv': """
     SELECT date(l.timestamp) AS dt, l.timestamp, l.ip, lower(trim(l.query)) AS query
@@ -334,10 +364,15 @@ def update_daily_aggregates(conn: duckdb.DuckDBPyConnection):
     conn.execute(f"""
       INSERT OR REPLACE INTO searches_daily
       SELECT date({time_col}) AS dt,
-        lower(trim(query)) AS query,
+        lower(trim(regexp_replace(query, '\\s+', ' '))) AS query,
         count(*) AS cnt
       FROM lake_search_logs
-      WHERE {time_col} IS NOT NULL AND query IS NOT NULL AND length(trim(query))>0 AND date({time_col}) > ?
+      WHERE {time_col} IS NOT NULL
+        AND query IS NOT NULL
+        AND length(trim(query))>0
+        AND lower(trim(query)) <> 'null'
+        AND length(lower(trim(regexp_replace(query, '\\s+', ' ')))) > 1
+        AND date({time_col}) > ?
       GROUP BY 1,2
     """, [max_s_dt])
   else:
@@ -345,9 +380,13 @@ def update_daily_aggregates(conn: duckdb.DuckDBPyConnection):
     if 'dt' in cols:
       conn.execute("""
         INSERT OR REPLACE INTO searches_daily
-        SELECT dt, lower(trim(query)) AS query, count(*) AS cnt
+        SELECT dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS query, count(*) AS cnt
         FROM lake_search_logs
-        WHERE dt > ? AND query IS NOT NULL AND length(trim(query))>0
+        WHERE dt > ?
+          AND query IS NOT NULL
+          AND length(trim(query))>0
+          AND lower(trim(query)) <> 'null'
+          AND length(lower(trim(regexp_replace(query, '\\s+', ' ')))) > 1
         GROUP BY 1,2
       """, [max_s_dt])
 
