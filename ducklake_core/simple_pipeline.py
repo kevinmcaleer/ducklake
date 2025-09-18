@@ -104,6 +104,30 @@ REPORT_QUERIES = {
     SELECT dt, count(DISTINCT query) AS distinct_queries, sum(cnt) AS searches
     FROM searches_daily GROUP BY 1 ORDER BY 1
   """,
+  'searches_today.csv': """
+    SELECT date(l.timestamp) AS dt, l.timestamp, l.ip, lower(trim(l.query)) AS query
+    FROM lake_search_logs l
+    WHERE l.timestamp IS NOT NULL
+      AND date(l.timestamp) = current_date
+      AND l.query IS NOT NULL AND length(trim(l.query))>0
+    ORDER BY l.timestamp
+  """,
+  'searches_today_totals.csv': """
+    WITH today AS (
+      SELECT date(timestamp) AS dt, lower(trim(query)) AS query
+      FROM lake_search_logs
+      WHERE timestamp IS NOT NULL
+        AND date(timestamp) = current_date
+        AND query IS NOT NULL AND length(trim(query))>0
+    )
+    SELECT dt,
+           COUNT(*) AS raw_events,
+           COUNT(DISTINCT query) AS distinct_queries,
+           (SELECT COALESCE(sum(cnt),0) FROM searches_daily WHERE dt = current_date) AS aggregated_query_events,
+           (SELECT COALESCE(sum(cnt),0) FROM searches_daily) AS total_searches_all_time
+    FROM today
+    GROUP BY 1
+  """,
 }
 
 

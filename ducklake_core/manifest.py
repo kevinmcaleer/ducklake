@@ -1,18 +1,10 @@
-"""
-Manifest management utilities for DuckLake.
-"""
-import duckdb
-from typing import List, Tuple, Optional
+"""Deprecated module placeholder (manifest removed).
 
-def get_manifest_rows(conn: duckdb.DuckDBPyConnection, source: str) -> List[Tuple]:
-    """Fetch manifest rows for a given source."""
-    return conn.execute(
-        """
-        SELECT path, format, dt FROM manifest WHERE source = ? ORDER BY run_ts
-        """,
-        [source],
-    ).fetchall()
+Previous manifest-based orchestration has been retired. The simplified pipeline
+discovers raw files directly under `data/raw/<source>/dt=YYYY-MM-DD/`.
+"""
 
-def print_manifest(conn: duckdb.DuckDBPyConnection):
-    rows = conn.execute("SELECT source, dt, path, format, rows FROM manifest").fetchall()
-    print(f"MANIFEST: {rows}")
+__all__: list[str] = []
+
+def __getattr__(name):  # pragma: no cover
+    raise AttributeError("manifest module removed; simple_pipeline performs discovery implicitly")
