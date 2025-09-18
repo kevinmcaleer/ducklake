@@ -20,8 +20,23 @@ REPORTS_DIR = ROOT / 'reports'
 
 SOURCES = ['page_count', 'search_logs']
 
-# Basic report SQL mapping (depends on aggregates)
 REPORT_QUERIES = {
+  'page_views_by_agent_os_device.csv': '''
+    SELECT
+      agent_type,
+      os,
+      device,
+      count(*) AS view_count
+    FROM silver_page_count
+    GROUP BY 1,2,3
+    ORDER BY view_count DESC
+  ''',
+  'searches_weekly.csv': """
+    SELECT strftime(dt, '%G-W%V') AS iso_week, sum(cnt) AS search_count
+    FROM searches_daily
+    GROUP BY 1
+    ORDER BY 1
+  """,
   'visits_pages_monthly.csv': """
     SELECT strftime(dt, '%Y%m') AS yyyymm, sum(views) AS cnt
     FROM page_views_daily
@@ -104,6 +119,14 @@ def ensure_core_tables(conn: duckdb.DuckDBPyConnection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_searches_daily_dt ON searches_daily(dt)")
   except Exception:
     pass
+
+
+def _scalar(conn: duckdb.DuckDBPyConnection, sql: str, params=None):
+  try:
+    row = conn.execute(sql, params or []).fetchone()
+    return row[0] if row and len(row) else None
+  except Exception:
+    return None
   try:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_searches_daily_query ON searches_daily(query)")
   except Exception:
@@ -172,6 +195,12 @@ def ingest_new_files(conn: duckdb.DuckDBPyConnection):
           tmp_path.rename(parquet_path)
         except Exception as e:
           raise RuntimeError(f"Failed replacing parquet partition {parquet_path}: {e}")
+        # Clean up any leftover .parquet.tmp files
+        if tmp_path.exists():
+          try:
+            tmp_path.unlink()
+          except Exception:
+            pass
         added_rows = conn.execute(f"SELECT COUNT(*) FROM read_csv_auto('{path}')").fetchone()[0]
       else:
         conn.execute(f"COPY (SELECT * FROM read_csv_auto('{path}')) TO '{parquet_path}' (FORMAT PARQUET)")
@@ -180,6 +209,13 @@ def ingest_new_files(conn: duckdb.DuckDBPyConnection):
       new += 1
     except Exception as e:
       print(f"Failed ingest {path}: {e}", file=sys.stderr)
+    # Always try to clean up .parquet.tmp files after each attempt
+    tmp_path = parquet_path.with_suffix('.parquet.tmp')
+    if tmp_path.exists():
+      try:
+        tmp_path.unlink()
+      except Exception:
+        pass
   return new
 
 
@@ -314,6 +350,74 @@ def simple_refresh(conn: duckdb.DuckDBPyConnection):
   p0 = time.time(); new_files = ingest_new_files(conn); phases['ingest_s'] = round(time.time()-p0, 3)
   # Lake views
   p0 = time.time(); create_lake_views(conn); phases['lake_views_s'] = round(time.time()-p0, 3)
+  # Silver enrichment (user_agent parsing) for page_count via pandas
+  p0 = time.time()
+  try:
+    import pandas as pd
+    try:
+      cols = [r[0] for r in conn.execute("DESCRIBE lake_page_count").fetchall()]
+    except Exception:
+      cols = []
+    if 'user_agent' in cols:
+      df = conn.execute("SELECT * FROM lake_page_count").df()
+      if not df.empty:
+        try:
+          import user_agents  # type: ignore
+          parsed = df['user_agent'].fillna('').map(lambda ua: user_agents.parse(ua))
+          df['agent_type'] = parsed.map(lambda o: 'bot' if o.is_bot else 'human')
+          df['os'] = parsed.map(lambda o: o.os.family or 'unknown')
+          df['os_version'] = parsed.map(lambda o: o.os.version_string or '')
+          df['browser'] = parsed.map(lambda o: o.browser.family or 'unknown')
+          df['browser_version'] = parsed.map(lambda o: o.browser.version_string or '')
+          df['device'] = parsed.map(lambda o: o.device.family or 'unknown')
+          df['is_mobile'] = parsed.map(lambda o: int(o.is_mobile))
+          df['is_tablet'] = parsed.map(lambda o: int(o.is_tablet))
+          df['is_pc'] = parsed.map(lambda o: int(o.is_pc))
+          df['is_bot'] = parsed.map(lambda o: int(o.is_bot))
+        except Exception:
+          # Fallback heuristic
+            def _fallback_parse(ua: str):
+              if not ua: return ('unknown','unknown','', 'unknown','', 'unknown',0,0,0,0)
+              u = ua.lower()
+              agent_type = 'bot' if any(x in u for x in ['bot','spider','crawl']) else 'human'
+              os_name = 'windows' if 'windows' in u else ('android' if 'android' in u else ('linux' if 'linux' in u else ('mac' if 'mac os' in u or 'macintosh' in u else 'unknown')))
+              browser = 'chrome' if 'chrome/' in u else ('firefox' if 'firefox/' in u else ('safari' if 'safari/' in u else 'unknown'))
+              device = 'mobile' if 'mobile' in u else ('tablet' if 'tablet' in u else ('pc' if os_name in ('windows','linux','mac') else 'unknown'))
+              is_mobile = 1 if device=='mobile' else 0
+              is_tablet = 1 if device=='tablet' else 0
+              is_pc = 1 if device=='pc' else 0
+              is_bot = 1 if agent_type=='bot' else 0
+              return (agent_type, os_name, '', browser, '', device, is_mobile, is_tablet, is_pc, is_bot)
+            parsed = df['user_agent'].fillna('').map(_fallback_parse)
+            df['agent_type'] = parsed.map(lambda t: t[0])
+            df['os'] = parsed.map(lambda t: t[1])
+            df['os_version'] = parsed.map(lambda t: t[2])
+            df['browser'] = parsed.map(lambda t: t[3])
+            df['browser_version'] = parsed.map(lambda t: t[4])
+            df['device'] = parsed.map(lambda t: t[5])
+            df['is_mobile'] = parsed.map(lambda t: t[6])
+            df['is_tablet'] = parsed.map(lambda t: t[7])
+            df['is_pc'] = parsed.map(lambda t: t[8])
+            df['is_bot'] = parsed.map(lambda t: t[9])
+        # Derive dt
+        if 'timestamp' in df.columns:
+          df['dt'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.date
+        elif 'dt' in df.columns:
+          df['dt'] = pd.to_datetime(df['dt'], errors='coerce').dt.date
+        else:
+          df['dt'] = None
+        silver_dir = (ROOT / 'silver' / 'page_count')
+        silver_dir.mkdir(parents=True, exist_ok=True)
+        out_path = silver_dir / 'page_count_enriched.parquet'
+        df.to_parquet(out_path, index=False)
+        conn.execute(f"CREATE OR REPLACE VIEW silver_page_count AS SELECT * FROM read_parquet('{out_path}', union_by_name=true)")
+      else:
+        conn.execute("CREATE OR REPLACE VIEW silver_page_count AS SELECT * FROM lake_page_count WHERE 0=1")
+    else:
+      conn.execute("CREATE OR REPLACE VIEW silver_page_count AS SELECT * FROM lake_page_count WHERE 0=1")
+  except Exception as e:
+    print(f"[WARN] Silver enrichment failed: {e}")
+  phases['silver_enrich_s'] = round(time.time()-p0, 3)
   # Aggregates
   p0 = time.time(); update_daily_aggregates(conn); phases['aggregates_s'] = round(time.time()-p0, 3)
   # Reports
@@ -326,8 +430,8 @@ def simple_refresh(conn: duckdb.DuckDBPyConnection):
   phases['total_s'] = total
   return {
     'new_files': new_files,
-    'latest_page_dt': conn.execute("SELECT max(dt) FROM page_views_daily").fetchone()[0],
-    'latest_search_dt': conn.execute("SELECT max(dt) FROM searches_daily").fetchone()[0],
+    'latest_page_dt': _scalar(conn, "SELECT max(dt) FROM page_views_daily"),
+    'latest_search_dt': _scalar(conn, "SELECT max(dt) FROM searches_daily"),
     'validation': validate,
     'anomalies': {k: len(v.get('anomalies', [])) for k,v in anomalies.get('series', {}).items() if isinstance(v, dict) and 'anomalies' in v},
     'timings': phases,

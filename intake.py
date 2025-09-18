@@ -531,6 +531,7 @@ def print_subtask_status(subtask, status):
 
 
 def cli():
+    print("[DEBUG] intake.py cli() called")
     parser = argparse.ArgumentParser(description="DuckDB lakehouse intake: bronze -> silver -> gold")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -592,6 +593,7 @@ def cli():
     args = parser.parse_args()
     ensure_dirs()
     cfg = load_sources_config(ROOT / "configs" / "sources.yml")
+    print(f"[DEBUG] Loaded sources config: {cfg}")
 
     def cleanup_manifest():
         rows = conn.execute("SELECT source, dt, path FROM manifest").fetchall()
@@ -884,12 +886,14 @@ def cli():
         build_silver_from_manifest(args.source, ((cfg or {}).get(args.source, {})))
         build_gold_content_rollups(args.source, title_col=args.title_col, value_col=args.value_col, agg=args.agg)
     elif args.cmd == "refresh":
+        print("[DEBUG] Entering for-loop over sources in refresh command")
         pipeline_start = time.time()
         # Group tasks by layer
         bronze_tasks = []
         silver_tasks = []
         gold_tasks = []
         for src_name, src_cfg in (cfg or {}).items():
+            print(f"[DEBUG] Will process silver for source: {repr(src_name)}")
             bronze_tasks.append((src_name, [
                 ("Ingest", lambda: ingest_from_config(src_name, src_cfg)),
                 ("Backfill manifest", lambda: backfill_manifest_from_bronze(src_name)),

@@ -1,16 +1,17 @@
-"""DuckLake core modules: bronze, silver, gold, manifest, utils."""
+"""Simplified DuckLake core: only simple pipeline + anomaly utilities."""
 
-from .bronze import ingest_bronze, backfill_manifest_from_bronze  # re-export
-from .silver import build_silver_from_manifest  # re-export
-from .gold import build_gold_content_rollups  # re-export
-from .manifest import get_manifest_rows, print_manifest  # re-export
-from . import utils  # noqa: F401
+from .simple_pipeline import (
+    simple_refresh,
+    run_simple_reports,
+    validate_simple_pipeline,
+    ensure_core_tables,
+)
+from .anomaly import detect_anomalies
 
 __all__ = [
-    "ingest_bronze",
-    "backfill_manifest_from_bronze",
-    "build_silver_from_manifest",
-    "build_gold_content_rollups",
-    "get_manifest_rows",
-    "print_manifest",
+    "simple_refresh",
+    "run_simple_reports",
+    "validate_simple_pipeline",
+    "ensure_core_tables",
+    "detect_anomalies",
 ]

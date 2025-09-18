@@ -12,12 +12,8 @@ from .manifest import get_manifest_rows
 from .utils import _ident, _sql_str, type_cast_sql, read_sql_for, _col_ref
 
 
-def build_silver_from_manifest(
-    conn: duckdb.DuckDBPyConnection,
-    lake_root: pathlib.Path,
-    source_name: str,
-    cfg: Dict,
-):
+def build_silver_from_manifest(conn: duckdb.DuckDBPyConnection, lake_root: pathlib.Path, source_name: str, cfg: Dict):
+    print(f"[DEBUG] build_silver_from_manifest called with source_name={repr(source_name)}")
     conn.commit()
     expect_schema: Dict[str, str] = (cfg.get("expect_schema") or {}) if cfg else {}
     parse = (cfg or {}).get("parse") or {}
@@ -34,46 +30,61 @@ def build_silver_from_manifest(
     silver_dir = lake_root / "silver" / f"source={source_name}"
     silver_dir.mkdir(parents=True, exist_ok=True)
 
-    for path_str, fmt, dt in rows:
-        p = pathlib.Path(path_str)
-        # Skip hidden/system files (e.g., .DS_Store)
-        if p.name.startswith('.'):
-            print(f"SKIP: Hidden/system file in manifest: {path_str}")
-            continue
-        if not p.exists():
-            print(f"WARN: Skipping missing file referenced in manifest: {path_str}")
-            continue
-        read = read_sql_for(conn, path_str, fmt)
-        # Discover available columns
+
+    from .user_agent_utils import parse_user_agent
+    import pandas as pd
+
+    user_agent_cols = [
+        "agent_type", "os", "os_version", "browser", "browser_version", "device",
+        "is_mobile", "is_tablet", "is_pc", "is_bot"
+    ]
+    if source_name == "page_count":
+        # Clean up all old silver output for this source to avoid schema mismatches
+        if silver_dir.exists():
+            import shutil
+            shutil.rmtree(silver_dir)
+        silver_dir.mkdir(parents=True, exist_ok=True)
+        # Use a single consistent run directory for all output
+        run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        for path_str, fmt, dt in rows:
+            p = pathlib.Path(path_str)
+            if p.name.startswith('.'):
+                print(f"SKIP: Hidden/system file in manifest: {path_str}")
+                continue
+            if not p.exists():
+                print(f"WARN: Skipping missing file referenced in manifest: {path_str}")
+                continue
+            read = read_sql_for(conn, path_str, fmt)
+            # Load to pandas for enrichment
+            df = conn.execute(f"SELECT *, '{dt}' AS dt FROM ({read}) r").df()
+            if "user_agent" not in df.columns:
+                print(f"[WARN] user_agent column missing in file {path_str}; adding empty strings")
+                df["user_agent"] = ""
+            enrich = df["user_agent"].fillna("").apply(parse_user_agent)
+            for col in user_agent_cols:
+                df[col] = enrich.apply(lambda d: d.get(col))
+            out_dir = silver_dir / f"run={run}" / "part.parquet" / f"dt={dt}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = out_dir / "data_0.parquet"
+            print(f"[DEBUG] Columns in enriched DataFrame for dt={dt}: {list(df.columns)}")
+            df.to_parquet(out_file, index=False)
+        # Now build the view from this run
+        out_dir = silver_dir / f"run={run}"
+        view_src = f"read_parquet('{_sql_str(str(out_dir))}/**/*.parquet', union_by_name=true)"
+        view_cols = None
         try:
-            cols = [r[0] for r in conn.execute(f"DESCRIBE ({read})").fetchall()]
+            view_cols = [r[0] for r in conn.execute(f"DESCRIBE SELECT * FROM {view_src}").fetchall()]
         except duckdb.Error:
-            cols = []
-        colset = set(cols)
-        select_parts: list[str] = []
-        if expect_schema:
-            for k, v in expect_schema.items():
-                if k in colset:
-                    duck_t = type_cast_sql({k: v}, src_alias="r")
-                    select_parts.append(duck_t)
-                else:
-                    # missing column -> NULL as colname
-                    t = (v or "").lower()
-                    if t in ("string", "text", "str"):
-                        duck_t = "VARCHAR"
-                    elif t in ("int", "integer"):
-                        duck_t = "BIGINT"
-                    elif t in ("float", "double", "numeric", "decimal"):
-                        duck_t = "DOUBLE"
-                    elif t in ("datetime", "timestamp"):
-                        duck_t = "TIMESTAMP"
-                    elif t in ("date",):
-                        duck_t = "DATE"
-                    else:
-                        duck_t = "VARCHAR"
-                    select_parts.append(f"CAST(NULL AS {duck_t}) AS {_ident(k)}")
-        projection = ", ".join(select_parts) if select_parts else "*"
-        selects.append(f"SELECT {projection}, '{dt}' AS dt FROM ({read}) r")
+            view_cols = []
+        base_cols = [c for c in view_cols if c != "dt"]
+        proj = ", ".join(f"u.{_col_ref(c)}" for c in base_cols) if base_cols else "u.*"
+        view_sql = (
+            f"CREATE OR REPLACE VIEW silver_{_ident(source_name)} AS "
+            f"SELECT {proj}, TRY_CAST(u.dt AS DATE) AS dt FROM {view_src} u"
+        )
+        conn.execute(view_sql)
+    print(f"Silver built for source={source_name} at {out_dir}")
+    return
 
     if not selects:
         print(f"No usable bronze files for source={source_name}")

@@ -1,189 +1,100 @@
-# Ducklake: Lightweight DuckDB Lakehouse
+# Ducklake (Simplified DuckDB Pipeline)
 
-This repo organizes your data into bronze/silver/gold folders and a DuckDB database for quick analytics, with optional GeoIP enrichment.
+Lightweight analytics pipeline focused on two append-only sources: `page_count` and `search_logs`.
 
-## Project Structure
-
+Pipeline flow:
 ```
-bronze/         # Raw immutable files by source/format/dt/run
-silver/         # Typed, deduped, partitioned Parquet per source (views: silver_<source>)
-gold/           # Rollups (daily, all-time) (views: gold_<source>_daily, gold_<source>_all_time)
-configs/        # Source configs (sources.yml)
-data/geoip/     # GeoIP CSVs (GeoLite2)
-reports/        # Output CSV reports
-duckdb/lake.duckdb  # Main DuckDB database
-intake.py       # CLI for ingest/silver/gold/refresh
-run_imports.py  # Orchestrator for full pipeline
-queries.sql     # Ad-hoc analysis queries
-reports.sql     # CSV export scripts
-geoip_searches_by_country.sql # Example: search logs by country
+data/raw/<source>/dt=YYYY-MM-DD/*.csv  ->  data/lake/<source>/dt=YYYY-MM-DD.parquet  -> daily aggregates  -> reports/*.csv
 ```
 
-## Workflow
+Enrichment: A silver-style view (`silver_page_count`) is built inline, parsing `user_agent` strings into device / OS / browser / bot fields for reporting.
 
-### Simplified Pipeline (New)
-
-For append-only daily sources (`page_count`, `search_logs`) a faster minimal path is available:
-
+## Key Directories
 ```
-raw CSV  ->  lake parquet (one dt=YYYY-MM-DD.parquet per source/day)  -> daily aggregates  -> reports/*.csv
+data/raw/            # Input CSVs (partitioned by dt=... folders)
+data/lake/           # Per-day parquet partitions
+silver/page_count/   # Enriched parquet (single file) powering silver_page_count view
+reports/             # Generated CSV reports + JSON summaries
+ducklake_core/       # Core pipeline code (simple_pipeline.py, anomaly detection, utilities)
 ```
 
-Artifacts:
-- `data/raw/<source>/dt=YYYY-MM-DD/*.csv` (ingestion inputs)
-- `data/lake/<source>/dt=YYYY-MM-DD.parquet` (columnar partitions)
-- Tables: `page_views_daily`, `searches_daily`
-- Views: `lake_page_count`, `lake_search_logs`
-- Reports + summaries: `reports/*.csv`, `reports/simple_refresh_summary.json`, `reports/anomalies.json`
+## Generated Tables / Views
+- Tables: `processed_files`, `page_views_daily`, `searches_daily`, `ingestion_state`
+- Views: `lake_page_count`, `lake_search_logs`, `silver_page_count`
+- Reports include (non‑exhaustive): `page_views_by_agent_os_device.csv`, `visits_pages_daily.csv`, `searches_daily.csv`, `top_queries_30d.csv` etc.
 
-Commands:
+## Quick Start
 ```bash
-python intake.py bootstrap-raw        # one-time export from existing silver tables
-python intake.py simple-refresh       # ingest new raw -> parquet -> aggregates -> reports
-python intake.py simple-validate      # validation only (no ingestion)
-python intake.py fast-bootstrap-lake  # direct parquet export from silver (faster historical seed)
-```
-
-Makefile shortcuts:
-```bash
-make simple-refresh
-make validate
-make bootstrap-raw
-make fast-bootstrap-lake
-make cleanup-manifest
-```
-
-Performance: target <5s incremental; timings + anomaly detection included in output JSON.
-
-Migration: run legacy `refresh` alongside simplified mode until validated (see `design/simplified_pipeline.md`).
-
-### 1. Activate the venv
-
-```bash
+python -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
+python - <<'PY'
+import duckdb
+import pathlib
+from ducklake_core.simple_pipeline import simple_refresh
+conn = duckdb.connect('contentlake.ducklake')
+print(simple_refresh(conn))
+PY
+```
+Populate `data/raw/page_count/dt=YYYY-MM-DD/*.csv` and `data/raw/search_logs/dt=YYYY-MM-DD/*.csv` before running for meaningful results.
+
+## Adding Data
+- Drop daily CSV(s) for a source into: `data/raw/<source>/dt=2025-09-18/yourfile.csv`
+- Re-run `simple_refresh` (see below).
+
+## Running the Pipeline
+```python
+import duckdb
+from ducklake_core.simple_pipeline import simple_refresh
+conn = duckdb.connect('contentlake.ducklake')
+result = simple_refresh(conn)
+print(result)
+```
+Outputs:
+- Enriched view `silver_page_count`
+- Updated daily aggregates
+- Fresh CSVs in `reports/`
+- Validation JSON: `reports/simple_validation.json`
+- Summary JSON: `reports/simple_refresh_summary.json`
+- Anomaly summary counts embedded in returned dict.
+
+## User Agent Enrichment
+If `user_agents` library is installed it provides richer parsing; otherwise a lightweight heuristic fallback supplies:
+`agent_type, os, os_version, browser, browser_version, device, is_mobile, is_tablet, is_pc, is_bot`.
+
+View can be inspected:
+```sql
+DESCRIBE silver_page_count;
+SELECT agent_type, os, device, count(*) FROM silver_page_count GROUP BY 1,2,3 ORDER BY 4 DESC;
 ```
 
-### 2. Ingest data (bronze)
-
-- Local file:
-  ```bash
-  ```
-- URL:
-  ```bash
-  ```
-- SQLite:
-  ```bash
-  ```
-
-### 3. Build silver and gold
-
+## Reports
+Stored under `reports/`. Regeneration overwrites existing files. Example:
 ```bash
-python intake.py silver page_count
-python intake.py gold page_count --title-col url --agg count
+head reports/page_views_by_agent_os_device.csv
 ```
-Or refresh all sources:
+
+## Anomaly Detection
+Basic series anomaly marking retained (see `ducklake_core/anomaly.py`) and invoked inside `simple_refresh`.
+
+## Development
+- Keep new logic inside `ducklake_core/simple_pipeline.py`.
+- No legacy manifest / bronze / gold code remains (purged for clarity; recoverable via git history if needed).
+
+## Testing (Minimal)
+Install dev requirements then add tests for enrichment or aggregates as needed:
 ```bash
-python intake.py refresh
-```
-
-### 4. Orchestrate everything (recommended)
-
-```bash
-python run_imports.py --reports
-```
-This will ingest, build silver/gold, and run reports for all sources in `configs/sources.yml`.
-
-### 5. Query and analyze
-
-- In Python:
-  ```python
-  ```
-- Ad-hoc SQL:
-  ```bash
-  ```
-- Export CSV reports:
-  ```bash
-  ```
-
-## GeoIP Enrichment
-
-### Running tests
-
-Install dev dependencies and run the tests:
-
-Using uv:
-
-```sh
-uv pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt
 pytest -q
 ```
-
-Using pip:
-
-```sh
-python -m pip install -r requirements-dev.txt
-pytest -q
-```
-1. Download GeoLite2 CSVs from MaxMind and place in `data/geoip/`.
-2. Add `geoip_blocks` and `geoip_locations` to `configs/sources.yml` (see example).
-3. Run:
-   ```bash
-   python run_imports.py --only geoip_blocks,geoip_locations
-   ```
-4. Use `geoip_searches_by_country.sql` to aggregate search logs by country:
-   ```bash
-   duckdb duckdb/lake.duckdb -c ".read geoip_searches_by_country.sql"
-   ```
-
-## Automation
-
-- To run the full pipeline and generate reports daily (via cron):
-  ```cron
-  0 2 * * * cd /path/to/ducklake && /usr/bin/python3 run_imports.py --reports >> logs/cron.log 2>&1
 
 ## Troubleshooting
+- Empty reports: confirm raw CSVs exist in correct dt=... path and contain expected columns (`page_count` needs `url,ip,user_agent,timestamp`).
+- Missing enrichment columns: ensure `user_agents` installed or fallback will produce simplified values.
+- Stale aggregates: remove a partition parquet in `data/lake/<source>/` to force rebuild from raw.
 
-- If you see lock errors, remove `.ducklake.lock` if no other run is active.
-- If gold rollups fail, check your config and ensure the correct columns exist in silver.
-- For GeoIP, ensure the CSVs are present and configs are correct.
-Define sources in `configs/sources.yml`. Example:
+## Extending
+Add a new source by replicating the dt-partitioned raw folder convention, creating its parquet via ingestion logic adaptation, then extending aggregates/report SQL.
 
-```yaml
-page_count:
-  url: "https://page_count.kevsrobots.com/all-visits"
-  format: json
-  expect_schema:
-    url: string
-    ip: string
-    user_agent: string
-    timestamp: datetime
-  partitions: [dt]
-  normalize:
-    tz: UTC
-```
-
-Notes:
-- `expect_schema` drives casting in silver; include a `ts` column to derive dt from it, otherwise the bronze dt is used.
-- `primary_key` (optional) enables dedupe keeping the latest ts.
-- All silver and gold outputs are Parquet and accessible as DuckDB views.
-Define sources in `configs/sources.yml`. Example shipped:
-
-```yaml
-page_count:
-  url: "https://page_count.kevsrobots.com/all-visits"
-  format: json
-  expect_schema:
-    url: string
-    ip: string
-    user_agent: string
-    timestamp: datetime
-  partitions: [dt]
-  normalize:
-    tz: UTC
-```
-
-Notes:
-
-- expect_schema drives casting in silver; include a `ts` column to derive dt from it, otherwise the bronze dt is used.
-- primary_key (optional) enables dedupe keeping the latest ts.
-- All silver and gold outputs are Parquet and accessible as DuckDB views.
+## License
+See repository license file (if present). All legacy layers removed intentionally for simplicity.
