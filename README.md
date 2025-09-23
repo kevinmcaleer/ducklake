@@ -180,5 +180,53 @@ python dashboard.py --db contentlake.ducklake --port 8050
 Open http://127.0.0.1:8050 in your browser.
 Add a new source by replicating the dt-partitioned raw folder convention, creating its parquet via ingestion logic adaptation, then extending aggregates/report SQL.
 
+## TL;DR: Rebuild From Scratch
+
+End-to-end, destructive rebuild using local sources. Adjust paths as needed.
+
+```bash
+# 0) (Optional) Activate your venv
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+
+# 1) Reset everything (DB, lake, silver, reports, and raw)
+python run_refresh.py reset --include-raw
+
+# 2) Backfill from sources
+# 2a) Page Count: API full export if configured, else fall back to local JSONL archives
+#     Provide API base via --page-count-url and key via --page-count-key, or set env vars
+#     Fallback will scan _tmp_downloads/ for all-visits-*.jsonl if API not set
+
+# 2b) Search Logs: from local Search-Logs.log file
+#     Replace the path with your actual location
+python run_refresh.py --db contentlake.ducklake backfill \
+	--search-logs-file "/Volumes/Search Logs/Search-Logs.log" \
+	--json
+
+# (If you have a snapshot URL instead of a local file)
+# python run_refresh.py --db contentlake.ducklake backfill \
+#   --search-logs-url https://example.com/search-logs.jsonl \
+#   --json
+
+# 3) Refresh to rebuild views, aggregates, and reports (if you used --no-refresh earlier)
+python run_refresh.py --db contentlake.ducklake --json
+
+# 4) Validate outputs
+head reports/searches_summary.csv
+head reports/visits_pages_daily.csv
+cat reports/simple_validation.json | jq '.'
+cat reports/simple_refresh_summary.json | jq '.'
+
+# 5) Optional: spot-check search quality & top queries
+head reports/queries_quality.csv
+head reports/top_queries_7d.csv
+```
+
+Notes:
+- The backfill step auto-discovers and ingests page_count history: API full export when configured; otherwise it imports any local `_tmp_downloads/all-visits-*.jsonl` files.
+- Search logs parsing supports JSON/CSV and plain text patterns (e.g., `INFO:root:TIMESTAMP - IP: X - Query: Y`).
+- Query hygiene: reports filter literal `null` and single-character queries; normalization collapses whitespace and lowercases terms.
+
 ## License
 See repository license file (if present). All legacy layers removed intentionally for simplicity.

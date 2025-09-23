@@ -118,6 +118,17 @@ REPORT_QUERIES = {
     WHERE query_norm <> 'null'
     GROUP BY 1 ORDER BY cnt DESC LIMIT 100
   """,
+  'top_queries_3d.csv': """
+    WITH norm AS (
+      SELECT dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS query_norm, cnt
+      FROM searches_daily
+      WHERE dt >= current_date - INTERVAL 3 DAY
+    )
+    SELECT query_norm AS query, sum(cnt) AS cnt
+    FROM norm
+    WHERE query_norm <> 'null'
+    GROUP BY 1 ORDER BY cnt DESC LIMIT 100
+  """,
   'searches_summary.csv': """
     SELECT count(DISTINCT dt) AS days, count(*) AS query_day_rows, sum(cnt) AS total_searches,
            count(DISTINCT query) AS distinct_queries
@@ -177,6 +188,12 @@ REPORT_QUERIES = {
            (SELECT COALESCE(sum(cnt),0) FROM searches_daily) AS total_searches_all_time
     FROM today
     GROUP BY 1
+  """,
+  'searches_yesterday.csv': """ -- placeholder; dynamic SQL is injected in run_simple_reports
+    SELECT NULL WHERE FALSE
+  """,
+  'searches_yesterday_totals.csv': """ -- placeholder; dynamic SQL is injected in run_simple_reports
+    SELECT NULL WHERE FALSE
   """,
 }
 
@@ -446,7 +463,7 @@ def run_simple_reports(conn: duckdb.DuckDBPyConnection):
         out[fname] = 0
         continue
       effective_sql = dyn
-    elif fname in ('searches_today.csv','searches_today_totals.csv'):
+    elif fname in ('searches_today.csv','searches_today_totals.csv','searches_yesterday.csv','searches_yesterday_totals.csv'):
       # Determine a usable time column for searches today reports
       try:
         cols = [r[0] for r in conn.execute("DESCRIBE lake_search_logs").fetchall()]
@@ -459,36 +476,44 @@ def run_simple_reports(conn: duckdb.DuckDBPyConnection):
           break
       if time_col is None:
         # emit empty files with headers
-        if fname == 'searches_today.csv':
+        if fname in ('searches_today.csv','searches_yesterday.csv'):
           target.write_text('dt,timestamp,ip,query\n')
         else:
           target.write_text('dt,raw_events,distinct_queries,aggregated_query_events,total_searches_all_time\n')
         out[fname] = 0
         continue
-      if fname == 'searches_today.csv':
+      is_today = fname in ('searches_today.csv','searches_today_totals.csv')
+      date_expr = "current_date" if is_today else "current_date - INTERVAL 1 DAY"
+      if fname in ('searches_today.csv','searches_yesterday.csv'):
         effective_sql = f"""
-          SELECT date(l.{time_col}) AS dt, l.{time_col} AS timestamp, l.ip, lower(trim(l.query)) AS query
+          SELECT date(l.{time_col}) AS dt, l.{time_col} AS timestamp, l.ip,
+                 lower(trim(regexp_replace(l.query, '\\s+', ' '))) AS query
           FROM lake_search_logs l
           WHERE l.{time_col} IS NOT NULL
-            AND date(l.{time_col}) = current_date
+            AND date(l.{time_col}) = {date_expr}
             AND l.query IS NOT NULL AND length(trim(l.query))>0
+            AND lower(trim(l.query)) <> 'null'
+            AND length(lower(trim(regexp_replace(l.query, '\\s+', ' ')))) > 1
           ORDER BY l.{time_col}
         """
       else:
         effective_sql = f"""
-          WITH today AS (
-            SELECT date({time_col}) AS dt, lower(trim(query)) AS query
+          WITH d AS (
+            SELECT date({time_col}) AS dt,
+                   lower(trim(regexp_replace(query, '\\s+', ' '))) AS query
             FROM lake_search_logs
             WHERE {time_col} IS NOT NULL
-              AND date({time_col}) = current_date
+              AND date({time_col}) = {date_expr}
               AND query IS NOT NULL AND length(trim(query))>0
+              AND lower(trim(query)) <> 'null'
+              AND length(lower(trim(regexp_replace(query, '\\s+', ' ')))) > 1
           )
           SELECT dt,
                  COUNT(*) AS raw_events,
                  COUNT(DISTINCT query) AS distinct_queries,
-                 (SELECT COALESCE(sum(cnt),0) FROM searches_daily WHERE dt = current_date) AS aggregated_query_events,
+                 (SELECT COALESCE(sum(cnt),0) FROM searches_daily WHERE dt = {date_expr}) AS aggregated_query_events,
                  (SELECT COALESCE(sum(cnt),0) FROM searches_daily) AS total_searches_all_time
-          FROM today
+          FROM d
           GROUP BY 1
         """
     try:
