@@ -86,11 +86,14 @@ python run_refresh.py --db contentlake.ducklake    # basic refresh
 python run_refresh.py --db contentlake.ducklake --json
 
 # Snapshot ingest then refresh
-python run_refresh.py snapshot \
-	--db contentlake.ducklake \
+
+# Important: global flags like --db must appear BEFORE the subcommand.
+python run_refresh.py --db contentlake.ducklake snapshot \
 	--source search_logs \
 	--snapshot data/snapshots/search_logs_snapshot.csv \
 	--time-col timestamp
+
+# (Ensure the snapshot file exists; the CLI now emits a friendly error if it does not.)
 ```
 
 ## Incremental Snapshot Ingestion (Search Logs)
@@ -180,9 +183,13 @@ python dashboard.py --db contentlake.ducklake --port 8050
 Open http://127.0.0.1:8050 in your browser.
 Add a new source by replicating the dt-partitioned raw folder convention, creating its parquet via ingestion logic adaptation, then extending aggregates/report SQL.
 
-## TL;DR: Rebuild From Scratch
+## TL;DR: Reset, Fetch Latest, Rebuild & Validate
 
-End-to-end, destructive rebuild using local sources. Adjust paths as needed.
+Common one-liners and short flows for daily ops or a full nuke-and-reseed.
+
+### Full Destructive Rebuild (from raw / backfill)
+
+End-to-end rebuild using local or remote sources. Adjust paths as needed.
 
 ```bash
 # 0) (Optional) Activate your venv
@@ -221,12 +228,71 @@ cat reports/simple_refresh_summary.json | jq '.'
 # 5) Optional: spot-check search quality & top queries
 head reports/queries_quality.csv
 head reports/top_queries_7d.csv
+
+```
+
+### Fetch Just the Latest (Incremental)
+If you only want the most recent day(s) (page_count recent + optional search snapshot) and then refresh:
+
+```bash
+# Fetch page_count last 3 days (and search logs snapshot if configured) then refresh
+python run_refresh.py --db contentlake.ducklake fetch \
+	--sources page_count search_logs \
+	--days 3 \
+	--refresh \
+	--json
+
+# (Single-line equivalent)
+# python run_refresh.py --db contentlake.ducklake fetch --sources page_count search_logs --days 3 --refresh --json
+```
+
+### Force Re-import Last N Days
+Rebuild only the trailing window (e.g., correct late-arriving data or parser fixes) without touching historical partitions:
+
+```bash
+# Re-ingest only last 7 days for both sources
+python run_refresh.py --reimport-last-days 7 --force --force-sources page_count search_logs --db contentlake.ducklake --json
+```
+
+### Auto-Fetch Missing Recent Days
+Use `--auto-fetch-days N` (or `--auto-fetch-days all`) on a plain refresh to pull recent `page_count` raw data just-in-time before building aggregates.
+
+```bash
+# Fetch last 2 days of page_count automatically, then refresh pipeline
+python run_refresh.py --db contentlake.ducklake --auto-fetch-days 2 --json
+
+# Fetch ALL historical page_count (API full export fallback / local archives) then refresh
+python run_refresh.py --db contentlake.ducklake --auto-fetch-days all --json
+```
+
+### Snapshot-Based Search Logs Incremental
+When search logs are a cumulative snapshot file you periodically overwrite:
+
+```bash
+python run_refresh.py snapshot \
+	--db contentlake.ducklake \
+	--source search_logs \
+	--snapshot data/snapshots/search_logs_snapshot.csv \
+	--time-col timestamp \
+	--json
+```
+
+### Debug A Specific Day
+```bash
+# Inspect raw and lake partitions
+duckdb contentlake.ducklake \
+	"SELECT * FROM read_csv_auto('data/raw/search_logs/dt=2025-09-23/*.csv') LIMIT 5;" \
+	"SELECT * FROM lake_search_logs WHERE date(timestamp)='2025-09-23' LIMIT 5;" 
+```
 ```
 
 Notes:
 - The backfill step auto-discovers and ingests page_count history: API full export when configured; otherwise it imports any local `_tmp_downloads/all-visits-*.jsonl` files.
 - Search logs parsing supports JSON/CSV and plain text patterns (e.g., `INFO:root:TIMESTAMP - IP: X - Query: Y`).
 - Query hygiene: reports filter literal `null` and single-character queries; normalization collapses whitespace and lowercases terms.
+ - Use `--force` plus `--force-sources page_count` (or `search_logs`) to surgically clear just one source while preserving the other.
+ - `--rebuild-lake` with `--force` physically deletes parquet partitions so they are regenerated from raw.
+ - For performance on large historical sets, rely on `backfill` once then future daily `fetch --days 1 --refresh` runs.
 
 ## License
 See repository license file (if present). All legacy layers removed intentionally for simplicity.

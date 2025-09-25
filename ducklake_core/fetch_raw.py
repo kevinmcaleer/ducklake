@@ -83,6 +83,18 @@ def fetch_page_count_recent(days: int, overwrite: bool = False, base_url: str | 
         except Exception:
             pass  # fall back
 
+    # Flatten wrapper objects like {"visits": [...]} if present
+    if rows:
+        flattened = []
+        for r in rows:
+            if isinstance(r, dict) and 'visits' in r and isinstance(r['visits'], list):
+                for v in r['visits']:
+                    if isinstance(v, dict):
+                        flattened.append(v)
+            else:
+                flattened.append(r)
+        rows = flattened
+
     if not rows:
         fb = fallback_dir or DEFAULT_TMP_DOWNLOADS
         if fb.exists():
@@ -377,6 +389,17 @@ def fetch_page_count_all(overwrite: bool = False, base_url: str | None = None, a
                             continue
                 except Exception:
                     continue
+    # Flatten potential wrapper objects
+    if rows:
+        flattened = []
+        for r in rows:
+            if isinstance(r, dict) and 'visits' in r and isinstance(r['visits'], list):
+                for v in r['visits']:
+                    if isinstance(v, dict):
+                        flattened.append(v)
+            else:
+                flattened.append(r)
+        rows = flattened
     written = _write_rows_per_day(rows, out_base, 'page_count.csv', overwrite)
     return {'source': 'page_count', 'mode': 'all', 'days': len(written), 'written': written}
 

@@ -31,7 +31,12 @@ from ducklake_core.simple_pipeline import (
     RAW_DIR,
     REPORTS_DIR,
 )
-from ducklake_core.fetch_raw import fetch_page_count_recent, fetch_search_logs_snapshot, fetch_page_count_all, fetch_search_logs_file
+from ducklake_core.fetch_raw import (
+    fetch_page_count_recent,
+    fetch_search_logs_snapshot,
+    fetch_page_count_all,
+    fetch_search_logs_file,
+)
 
 
 def _connect(path: str):
@@ -101,11 +106,29 @@ def _reimport_last_days(con: duckdb.DuckDBPyConnection, args: argparse.Namespace
 
 def cmd_refresh(args: argparse.Namespace) -> int:
     con = _connect(args.db)
+    auto_fetch_result = None
+    # Optional auto-fetch integration (page_count only for now)
+    if getattr(args, 'auto_fetch_days', None):
+        afd = args.auto_fetch_days
+        try:
+            if str(afd).lower() == 'all':
+                print("[auto-fetch] fetching ALL page_count history before refresh")
+                auto_fetch_result = fetch_page_count_all(overwrite=False)
+            else:
+                days = int(afd)
+                if days <= 0:
+                    raise ValueError
+                print(f"[auto-fetch] fetching last {days} day(s) of page_count before refresh")
+                auto_fetch_result = fetch_page_count_recent(days, overwrite=False)
+        except Exception as e:
+            print(f"[auto-fetch] warning: failed auto fetch ({e})", file=sys.stderr)
     if args.force:
         _force_cleanup(con, args)
     if args.reimport_last_days:
         _reimport_last_days(con, args)
     result = simple_refresh(con)
+    if auto_fetch_result is not None:
+        result['auto_fetch'] = auto_fetch_result
     if args.json:
         print(json.dumps(result, indent=2, default=str))
     else:
@@ -121,6 +144,16 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
+    # Pre-flight snapshot file existence check for clearer error
+    snap_path = pathlib.Path(args.snapshot)
+    if not snap_path.exists():
+        msg = f"[snapshot] file not found: {args.snapshot}. Create it or provide the correct --snapshot path."
+        # Respect json flag (subcommand-level) for error formatting
+        if args.json:
+            print(json.dumps({"error": msg, "snapshot": str(snap_path)}, indent=2))
+        else:
+            print(msg, file=sys.stderr)
+        return 1
     con = _connect(args.db)
     snap_res = incremental_snapshot_ingest(
         con,
@@ -238,6 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", default="contentlake.ducklake", help="DuckDB database file path")
     p.add_argument("--root", default=".", help="Project root (unused placeholder for future)")
     p.add_argument("--json", action="store_true", help="Print machine-readable JSON output")
+    p.add_argument("--auto-fetch-days", help="Before refresh: fetch page_count recent N days (or 'all') automatically", default=None)
     sub = p.add_subparsers(dest="subcmd")
 
     # Global force / reimport options (apply to refresh only)
