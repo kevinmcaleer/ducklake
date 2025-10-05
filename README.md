@@ -38,6 +38,39 @@ PY
 ```
 Populate `data/raw/page_count/dt=YYYY-MM-DD/*.csv` and `data/raw/search_logs/dt=YYYY-MM-DD/*.csv` before running for meaningful results.
 
+### Built-in Page Count Fetch Endpoint
+The pipeline now has a hard-coded default base URL for `page_count` collection:
+
+```
+http://page_count.kevsrobots.com/all-visits
+```
+
+Fetch logic hierarchy for recent pulls (`fetch_page_count_recent`):
+1. Try: `?range={N}d&since={OLDEST_DATE}` (e.g. `?range=3d&since=2025-09-24`) – returns a JSON wrapper or array containing multiple days.
+2. Fallback (legacy): `?recent=N` if the above yields no rows or errors.
+3. Fallback to local archives: `_tmp_downloads/all-visits-*.jsonl` (last N files) if API produced zero rows.
+
+For full history (`fetch_page_count_all`):
+1. Try: `?range=all`
+2. Fallback: append `all=1` (legacy full export style)
+3. Fallback: ingest every local `_tmp_downloads/all-visits-*.jsonl` file
+
+Diagnostics now emitted in fetch JSON output:
+```jsonc
+"api": {
+	"attempted": true,
+	"attempted_urls": ["http://...range=3d&since=2025-09-24"],
+	"status_code": 200,
+	"rows_before_flatten": 1,
+	"rows_after_flatten": 53110
+},
+"fallback": { "used": false, "files_considered": 0 },
+"observed_dates": ["2025-09-24", "2025-09-25", "2025-09-26"],
+"missing_recent_dates": [],
+"freshness_gap_days": 0
+```
+This makes stale data root cause analysis immediate (API vs fallback vs absence of new archives).
+
 ## Adding Data
 - Drop daily CSV(s) for a source into: `data/raw/<source>/dt=2025-09-18/yourfile.csv`
 - Re-run `simple_refresh` (see below).
@@ -125,9 +158,62 @@ SELECT agent_type, os, device, count(*) FROM silver_page_count GROUP BY 1,2,3 OR
 ```
 
 ## Reports
-Stored under `reports/`. Regeneration overwrites existing files. Example:
+
+### SQL-Based Report Generation
+Reports are now generated from individual SQL files in `sql/reports/`. Each report:
+- Creates a CSV file in `reports/`
+- Creates a corresponding DuckDB view (prefixed with `v_`) for dashboard integration
+- Can be customized by editing the SQL file directly
+
+### Available Reports
+Key reports include:
+- `page_views_by_agent_os_device.csv` → view: `v_page_views_by_agent_os_device`
+- `visits_pages_daily.csv` → view: `v_visits_pages_daily` 
+- `searches_daily.csv` → view: `v_searches_daily`
+- `top_queries_all_time.csv` → view: `v_top_queries_all_time`
+- `top_queries_7d.csv`, `top_queries_30d.csv` → views: `v_top_queries_7d`, `v_top_queries_30d`
+- `searches_summary.csv` → view: `v_searches_summary`
+- `queries_quality.csv` → view: `v_queries_quality`
+
+### Dashboard Integration
+Connect Metabase or other BI tools to the DuckDB database and query the `v_*` views:
+```sql
+-- Example dashboard queries
+SELECT * FROM v_page_views_by_agent_os_device;
+SELECT * FROM v_top_queries_7d LIMIT 10;
+SELECT * FROM v_visits_pages_daily WHERE dt >= '2025-09-01';
+```
+
+### Adding Custom Reports
+1. Create a new `.sql` file in `sql/reports/`
+2. Add your SQL query (it will automatically create both CSV and view)
+3. Run `simple_refresh()` to generate the report
+
+Example custom report (`sql/reports/my_custom_report.sql`):
+```sql
+-- Daily page views with day-of-week analysis
+-- Creates view: v_my_custom_report
+SELECT 
+  dt,
+  views,
+  strftime(dt, '%w') AS day_of_week,
+  CASE strftime(dt, '%w') 
+    WHEN '0' THEN 'Sunday'
+    WHEN '6' THEN 'Saturday' 
+    ELSE 'Weekday' 
+  END AS day_type
+FROM page_views_daily 
+ORDER BY dt;
+```
+
+### Report Examples
 ```bash
+# View generated CSV reports
 head reports/page_views_by_agent_os_device.csv
+head reports/top_queries_7d.csv
+
+# Query views directly in DuckDB
+duckdb contentlake.ducklake "SELECT * FROM v_searches_summary;"
 ```
 
 ## Anomaly Detection
@@ -137,17 +223,70 @@ Basic series anomaly marking retained (see `ducklake_core/anomaly.py`) and invok
 - Keep new logic inside `ducklake_core/simple_pipeline.py`.
 - No legacy manifest / bronze / gold code remains (purged for clarity; recoverable via git history if needed).
 
-## Testing (Minimal)
-Install dev requirements then add tests for enrichment or aggregates as needed:
+## Testing
+
+### Running Tests
+Comprehensive test suite covers SQL reports, views, and data integrity:
 ```bash
 pip install -r requirements-dev.txt
-pytest -q
+pytest -v tests/
+
+# Run specific test categories
+pytest tests/test_sql_reports.py -v                    # SQL reports and views
+pytest tests/test_sql_reports.py::TestReportViews -v  # Just view creation tests
+```
+
+### Test Coverage
+- **SQL Report Loading**: Validates all SQL files can be parsed
+- **View Creation**: Ensures each report creates a working DuckDB view
+- **CSV Generation**: Confirms reports produce valid CSV output
+- **Data Integrity**: Validates business logic and calculations
+- **Report Structure**: Checks expected columns and data types
+
+### Adding Tests for New Reports
+When adding custom reports, extend the test suite:
+```python
+# In tests/test_sql_reports.py
+def test_my_custom_report_structure(self, test_db):
+    """Test my custom report has expected columns."""
+    sql = "SELECT iso_week, total_views FROM v_my_custom_report LIMIT 1"
+    result = test_db.execute(sql).fetchone()
+    assert result is not None
+    # Add specific validations...
 ```
 
 ## Troubleshooting
-- Empty reports: confirm raw CSVs exist in correct dt=... path and contain expected columns (`page_count` needs `url,ip,user_agent,timestamp`).
-- Missing enrichment columns: ensure `user_agents` installed or fallback will produce simplified values.
-- Stale aggregates: remove a partition parquet in `data/lake/<source>/` to force rebuild from raw.
+
+### Data Issues
+- **Empty reports**: Confirm raw CSVs exist in correct `dt=...` path and contain expected columns (`page_count` needs `url,ip,user_agent,timestamp`).
+- **Missing enrichment columns**: Ensure `user_agents` installed or fallback will produce simplified values.
+- **Stale aggregates**: Remove a partition parquet in `data/lake/<source>/` to force rebuild from raw.
+
+### SQL Report Issues
+- **Report not generating**: Check that `.sql` file exists in `sql/reports/` and has valid SQL syntax.
+- **View creation failed**: Check DuckDB logs - views require all referenced tables/columns to exist.
+- **Custom report errors**: Test your SQL directly in DuckDB CLI before adding to `sql/reports/`.
+
+### Testing SQL Reports
+```bash
+# Test individual SQL files
+duckdb contentlake.ducklake < sql/reports/my_report.sql
+
+# Check view was created
+duckdb contentlake.ducklake "SELECT * FROM v_my_report LIMIT 1;"
+
+# Run report tests
+pytest tests/test_sql_reports.py::TestSQLReports::test_load_sql_reports -v
+```
+
+### View Debugging
+```sql
+-- List all views
+SELECT table_name FROM information_schema.tables WHERE table_type = 'VIEW';
+
+-- Check view definition
+SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'v_my_report';
+```
 
 ## Extending
 ### Adding a New Source
@@ -158,29 +297,68 @@ pytest -q
 5. Run `simple_refresh` to ingest and generate outputs.
 
 ### Adding a Custom Report
-Edit `REPORT_QUERIES` dict in `simple_pipeline.py`:
-```python
-REPORT_QUERIES['my_custom_report.csv'] = """
-SELECT dt, sum(views) AS total
+Create a new SQL file in `sql/reports/`:
+```bash
+# Create the SQL file
+cat > sql/reports/my_custom_report.sql << 'EOF'
+-- My custom weekly summary report
+-- Creates view: v_my_custom_report
+SELECT 
+  strftime(dt, '%G-W%V') AS iso_week,
+  sum(views) AS total_views,
+  avg(views) AS avg_daily_views,
+  count(*) AS days_in_week
 FROM page_views_daily
-GROUP BY 1 ORDER BY 1
-"""
+GROUP BY 1 
+ORDER BY 1;
+EOF
 ```
-Re-run `simple_refresh` and inspect `reports/my_custom_report.csv`.
+Re-run `simple_refresh()` and inspect:
+- CSV: `reports/my_custom_report.csv`
+- DuckDB view: `v_my_custom_report`
 
-## Dashboard (Optional)
-An optional Dash dashboard (`dashboard.py`) provides three pie charts:
-- Visits by OS
-- Visits by Agent Type (human vs bot)
-- Visits by Device Type
+```bash
+# Check the generated report and view
+head reports/my_custom_report.csv
+duckdb contentlake.ducklake "SELECT * FROM v_my_custom_report LIMIT 5;"
+```
 
-Install dev extras and run:
+## Dashboard Integration
+
+### Built-in Views for BI Tools
+All reports automatically create DuckDB views (prefixed with `v_`) that can be connected to any BI tool:
+
+**Metabase Setup:**
+1. Add DuckDB database connection pointing to `contentlake.ducklake`
+2. Query views directly: `SELECT * FROM v_top_queries_7d`
+3. Create dashboards using the pre-built views
+
+**Key Dashboard Views:**
+```sql
+-- Page traffic analysis
+SELECT * FROM v_visits_pages_daily;
+SELECT * FROM v_busiest_hours_utc;
+SELECT * FROM v_page_views_by_agent_os_device;
+
+-- Search analytics
+SELECT * FROM v_top_queries_7d;
+SELECT * FROM v_searches_summary;
+SELECT * FROM v_queries_quality;
+
+-- Trend analysis
+SELECT * FROM v_visits_pages_wow;  -- Week-over-week growth
+```
+
+### Optional Dash Dashboard
+A legacy Dash dashboard (`dashboard.py`) provides basic pie charts:
 ```bash
 pip install -r requirements-dev.txt  # includes dash + plotly
-python run_refresh.py --db contentlake.ducklake  # ensure fresh enriched data
+python run_refresh.py --db contentlake.ducklake  # ensure fresh data
 python dashboard.py --db contentlake.ducklake --port 8050
 ```
 Open http://127.0.0.1:8050 in your browser.
+
+**Recommendation**: Use the DuckDB views with modern BI tools (Metabase, Grafana, etc.) for better functionality.
 Add a new source by replicating the dt-partitioned raw folder convention, creating its parquet via ingestion logic adaptation, then extending aggregates/report SQL.
 
 ## TL;DR: Reset, Fetch Latest, Rebuild & Validate
@@ -235,15 +413,14 @@ head reports/top_queries_7d.csv
 If you only want the most recent day(s) (page_count recent + optional search snapshot) and then refresh:
 
 ```bash
-# Fetch page_count last 3 days (and search logs snapshot if configured) then refresh
+# Fetch last 3 days for BOTH sources (default) then refresh
 python run_refresh.py --db contentlake.ducklake fetch \
-	--sources page_count search_logs \
-	--days 3 \
-	--refresh \
-	--json
+  --days 3 \
+  --refresh \
+  --json
 
-# (Single-line equivalent)
-# python run_refresh.py --db contentlake.ducklake fetch --sources page_count search_logs --days 3 --refresh --json
+# To fetch only one source (e.g. page_count):
+# python run_refresh.py --db contentlake.ducklake fetch --sources page_count --days 3 --refresh --json
 ```
 
 ### Force Re-import Last N Days
@@ -263,6 +440,8 @@ python run_refresh.py --db contentlake.ducklake --auto-fetch-days 2 --json
 
 # Fetch ALL historical page_count (API full export fallback / local archives) then refresh
 python run_refresh.py --db contentlake.ducklake --auto-fetch-days all --json
+
+Auto-fetch uses the same hierarchy (range/since -> recent= -> local archives). To override the default base URL supply `--page-count-url` or set `PAGE_COUNT_API_URL`.
 ```
 
 ### Snapshot-Based Search Logs Incremental

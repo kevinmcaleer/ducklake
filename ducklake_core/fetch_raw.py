@@ -7,6 +7,9 @@ DEFAULT_TMP_DOWNLOADS = pathlib.Path('_tmp_downloads')
 PAGE_COUNT_ENV_URL = 'PAGE_COUNT_API_URL'  # Expected base URL e.g. https://example/api/page_count
 PAGE_COUNT_ENV_KEY = 'PAGE_COUNT_API_KEY'  # Optional auth token
 
+# Hard-coded default page_count collection endpoint (user confirmed it is stable)
+DEFAULT_PAGE_COUNT_BASE_URL = 'http://page_count.kevsrobots.com/all-visits'
+
 SEARCH_LOGS_ENV_URL = 'SEARCH_LOGS_API_URL'
 SEARCH_LOGS_ENV_KEY = 'SEARCH_LOGS_API_KEY'
 
@@ -49,43 +52,76 @@ def _write_rows_per_day(rows, out_base: pathlib.Path, filename: str, overwrite: 
 
 
 def fetch_page_count_recent(days: int, overwrite: bool = False, base_url: str | None = None, api_key: str | None = None, fallback_dir: pathlib.Path | None = None):
-    """Fetch last N days of page_count events and write raw CSV partitions.
+    """Fetch last N days of page_count events and write raw CSV partitions with diagnostics.
 
-    Strategy:
-      1. If base_url provided (or via PAGE_COUNT_API_URL env) call `${base_url}?recent=days` expecting JSONL or JSON array.
-      2. If request fails or no base_url, attempt to read fallback_dir JSONL files matching all-visits-*.jsonl (used for local dev).
+    Added diagnostics fields to help troubleshoot missing / stale data situations:
+      - api: { attempted: bool, url, status_code, error, rows_before_flatten, rows_after_flatten }
+      - fallback: { used: bool, dir, files_considered, files_loaded }
+      - observed_dates: sorted list of distinct dt parsed from timestamp/event_ts/time
+      - earliest_ts / latest_ts (raw ISO strings if present)
+      - expected_recent_dates: list of date strings we attempted to fetch (today - i)
+      - missing_recent_dates: expected - observed intersection for quick gap view
+      - freshness_gap_days: (today - max(observed_date)) if any rows else None
+      - zero_rows_reason when 0 rows (api_empty | api_error | no_fallback_files)
     """
-    base_url = base_url or os.getenv(PAGE_COUNT_ENV_URL)
+    base_url = base_url or os.getenv(PAGE_COUNT_ENV_URL) or DEFAULT_PAGE_COUNT_BASE_URL
     api_key = api_key or os.getenv(PAGE_COUNT_ENV_KEY)
     out_base = RAW_DIR / 'page_count'
     out_base.mkdir(parents=True, exist_ok=True)
 
-    rows = []
-    if base_url:
-        url = f"{base_url}?recent={days}" if 'recent=' not in base_url else base_url
-        headers = {'Authorization': f"Bearer {api_key}"} if api_key else {}
-        try:
-            resp = requests.get(url, headers=headers, timeout=60)
-            resp.raise_for_status()
-            txt = resp.text.strip()
-            if txt.startswith('['):
-                data = resp.json()
-                rows.extend(data if isinstance(data, list) else [])
-            else:
-                for line in txt.splitlines():
-                    line=line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rows.append(json.loads(line))
-                    except Exception:
-                        continue
-        except Exception:
-            pass  # fall back
+    today = datetime.date.today()
+    expected_recent_dates = [str(today - datetime.timedelta(days=i)) for i in range(days-1, -1, -1)]
 
+    rows: list[dict] = []
+    api_diag = {
+        'attempted': False,
+        'attempted_urls': [],
+        'status_code': None,
+        'error': None,
+        'rows_before_flatten': 0,
+        'rows_after_flatten': 0,
+    }
+    if base_url:
+        headers = {'Authorization': f"Bearer {api_key}"} if api_key else {}
+        # Attempt strategy hierarchy:
+        # 1) range={days}d with since = earliest expected date (oldest) -> expects list or JSONL
+        # 2) fallback to recent=days (legacy)
+        earliest_expected = expected_recent_dates[0]
+        candidate_urls = [
+            f"{base_url}?range={days}d&since={earliest_expected}",
+            (f"{base_url}?recent={days}" if 'recent=' not in base_url else base_url),
+        ]
+        for attempt_url in candidate_urls:
+            if rows:  # stop after first success with rows
+                break
+            api_diag['attempted'] = True
+            api_diag['attempted_urls'].append(attempt_url)
+            try:
+                resp = requests.get(attempt_url, headers=headers, timeout=60)
+                api_diag['status_code'] = resp.status_code
+                resp.raise_for_status()
+                txt = resp.text.strip()
+                if txt.startswith('['):
+                    data = resp.json()
+                    if isinstance(data, list):
+                        rows.extend(data)
+                else:
+                    for line in txt.splitlines():
+                        line=line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rows.append(json.loads(line))
+                        except Exception:
+                            continue
+            except Exception as e:
+                # Record last error but continue to next attempt
+                api_diag['error'] = repr(e)
+
+    api_diag['rows_before_flatten'] = len(rows)
     # Flatten wrapper objects like {"visits": [...]} if present
     if rows:
-        flattened = []
+        flattened: list[dict] = []
         for r in rows:
             if isinstance(r, dict) and 'visits' in r and isinstance(r['visits'], list):
                 for v in r['visits']:
@@ -94,22 +130,86 @@ def fetch_page_count_recent(days: int, overwrite: bool = False, base_url: str | 
             else:
                 flattened.append(r)
         rows = flattened
+    api_diag['rows_after_flatten'] = len(rows)
 
+    fb_diag = {
+        'used': False,
+        'dir': None,
+        'files_considered': 0,
+        'files_loaded': 0,
+    }
     if not rows:
         fb = fallback_dir or DEFAULT_TMP_DOWNLOADS
+        fb_diag['dir'] = str(fb)
         if fb.exists():
-            for p in sorted(fb.glob('all-visits-*.jsonl'))[-days:]:
+            files = sorted(fb.glob('all-visits-*.jsonl'))[-days:]
+            fb_diag['files_considered'] = len(files)
+            for p in files:
                 try:
+                    loaded_any = False
                     for line in p.read_text().splitlines():
                         line=line.strip()
                         if not line: continue
                         try:
-                            rows.append(json.loads(line))
+                            rows.append(json.loads(line)); loaded_any = True
                         except Exception:
                             continue
+                    if loaded_any:
+                        fb_diag['files_loaded'] += 1
                 except Exception:
                     continue
-    return {'source': 'page_count', 'days': days, 'written': _write_rows_per_day(rows, out_base, 'page_count.csv', overwrite)}
+        fb_diag['used'] = len(rows) > 0
+
+    # Derive observed date set & ts range
+    observed_dates_set = set()
+    earliest_ts = None
+    latest_ts = None
+    for r in rows:
+        ts = r.get('timestamp') or r.get('event_ts') or r.get('time')
+        if ts:
+            # Normalize parse to date for list
+            dt_obj = _iso_date(str(ts))
+            if dt_obj:
+                observed_dates_set.add(dt_obj)
+            # maintain min/max lexicographically by ISO (after coercion)
+            try:
+                # Force ISO-like comparable string
+                iso = str(ts)
+                if earliest_ts is None or iso < earliest_ts:
+                    earliest_ts = iso
+                if latest_ts is None or iso > latest_ts:
+                    latest_ts = iso
+            except Exception:
+                pass
+    observed_dates = sorted(str(d) for d in observed_dates_set)
+    max_dt = max(observed_dates_set) if observed_dates_set else None
+    freshness_gap_days = (today - max_dt).days if max_dt else None
+    missing_recent_dates = [d for d in expected_recent_dates if d not in observed_dates]
+
+    zero_rows_reason = None
+    if len(rows) == 0:
+        if api_diag['attempted'] and api_diag['error']:
+            zero_rows_reason = 'api_error'
+        elif api_diag['attempted'] and api_diag['status_code'] and api_diag['status_code'] == 200:
+            zero_rows_reason = 'api_empty'
+        else:
+            zero_rows_reason = 'no_fallback_files'
+
+    written = _write_rows_per_day(rows, out_base, 'page_count.csv', overwrite)
+    return {
+        'source': 'page_count',
+        'days': days,
+        'written': written,
+        'api': api_diag,
+        'fallback': fb_diag,
+        'observed_dates': observed_dates,
+        'expected_recent_dates': expected_recent_dates,
+        'missing_recent_dates': missing_recent_dates,
+        'earliest_ts': earliest_ts,
+        'latest_ts': latest_ts,
+        'freshness_gap_days': freshness_gap_days,
+        'zero_rows_reason': zero_rows_reason,
+    }
 
 
 def fetch_search_logs_snapshot(snapshot_url: str | None = None, overwrite: bool = False, base_url: str | None = None, api_key: str | None = None):
@@ -319,79 +419,100 @@ def fetch_search_logs_file(path: str, overwrite: bool = False, assume_utc: bool 
 
 
 def fetch_page_count_all(overwrite: bool = False, base_url: str | None = None, api_key: str | None = None, fallback_dir: pathlib.Path | None = None):
-    """Fetch ALL available page_count events and write raw CSV partitions.
+    """Fetch ALL available page_count events and write raw CSV partitions with diagnostics.
 
-    Strategy hierarchy:
-      1. If base_url provided attempt a full export by appending `all=1` (best-effort; silently falls back).
-      2. Fallback: read EVERY local JSONL archive matching all-visits-*.jsonl in fallback_dir (default _tmp_downloads).
-
-    This is intentionally conservative and tolerant of partial failures: any unreadable
-    archive is skipped. Duplicate rows across archives are not de-duplicated (assumed
-    each file represents a distinct day). If multiple archives contain overlapping
-    days, later files simply add more rows for that day prior to writing the CSV.
+    Diagnostics similar to fetch_page_count_recent (without expected_recent_dates) to aid full backfill troubleshooting.
     """
-    base_url = base_url or os.getenv(PAGE_COUNT_ENV_URL)
+    base_url = base_url or os.getenv(PAGE_COUNT_ENV_URL) or DEFAULT_PAGE_COUNT_BASE_URL
     api_key = api_key or os.getenv(PAGE_COUNT_ENV_KEY)
     out_base = RAW_DIR / 'page_count'
     out_base.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
 
-    # Attempt single-shot full export if API provided
+    api_diag = {
+        'attempted': False,
+        'attempted_urls': [],
+        'status_code': None,
+        'error': None,
+        'rows_before_flatten': 0,
+        'rows_after_flatten': 0,
+    }
     if base_url:
-        # Try to append all=1 unless caller already supplied a query parameter
-        full_url = base_url
+        # Strategy attempts: range=all, then all=1 legacy param
+        candidate_urls = []
+        candidate_urls.append(f"{base_url}?range=all")
         if 'all=' not in base_url:
             if '?' in base_url:
-                full_url = base_url + '&all=1'
+                candidate_urls.append(base_url + '&all=1')
             else:
-                full_url = base_url + '?all=1'
+                candidate_urls.append(base_url + '?all=1')
+        else:
+            candidate_urls.append(base_url)
         headers = {'Authorization': f"Bearer {api_key}"} if api_key else {}
-        try:
-            resp = requests.get(full_url, headers=headers, timeout=180)
-            resp.raise_for_status()
-            txt = resp.text.strip()
+        for attempt_url in candidate_urls:
+            if rows:
+                break
+            api_diag['attempted'] = True
+            api_diag['attempted_urls'].append(attempt_url)
             try:
-                data = resp.json()
-                if isinstance(data, list):
-                    rows.extend(data)
-                elif isinstance(data, dict) and 'visits' in data and isinstance(data['visits'], list):
-                    rows.extend(data['visits'])
-                else:
-                    # Fallback line parsing if unexpected structure
+                resp = requests.get(attempt_url, headers=headers, timeout=180)
+                api_diag['status_code'] = resp.status_code
+                resp.raise_for_status()
+                txt = resp.text.strip()
+                try:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        rows.extend(data)
+                    elif isinstance(data, dict) and 'visits' in data and isinstance(data['visits'], list):
+                        rows.extend(data['visits'])
+                    else:
+                        for line in txt.splitlines():
+                            line=line.strip()
+                            if not line: continue
+                            try: rows.append(json.loads(line))
+                            except Exception: continue
+                except Exception:
                     for line in txt.splitlines():
                         line=line.strip()
                         if not line: continue
                         try: rows.append(json.loads(line))
                         except Exception: continue
-            except Exception:
-                # Line-delimited fallback
-                for line in txt.splitlines():
-                    line=line.strip()
-                    if not line: continue
-                    try: rows.append(json.loads(line))
-                    except Exception: continue
-        except Exception:
-            # Ignore and fall back to local archives
-            rows = []
+            except Exception as e:
+                api_diag['error'] = repr(e)
 
-    # Fallback: local archives
+    api_diag['rows_before_flatten'] = len(rows)
+    # Fallback: local archives if no API rows
+    fb_diag = {
+        'used': False,
+        'dir': None,
+        'files_considered': 0,
+        'files_loaded': 0,
+    }
     if not rows:
         fb = fallback_dir or DEFAULT_TMP_DOWNLOADS
+        fb_diag['dir'] = str(fb)
         if fb.exists():
-            for p in sorted(fb.glob('all-visits-*.jsonl')):
+            files = sorted(fb.glob('all-visits-*.jsonl'))
+            fb_diag['files_considered'] = len(files)
+            for p in files:
                 try:
+                    loaded_any = False
                     for line in p.read_text().splitlines():
-                        line=line.strip()
+                        line=line.strip();
                         if not line: continue
                         try:
-                            rows.append(json.loads(line))
+                            rows.append(json.loads(line)); loaded_any = True
                         except Exception:
                             continue
+                    if loaded_any:
+                        fb_diag['files_loaded'] += 1
                 except Exception:
                     continue
+        fb_diag['used'] = len(rows) > 0
+
     # Flatten potential wrapper objects
     if rows:
-        flattened = []
+        flattened: list[dict] = []
         for r in rows:
             if isinstance(r, dict) and 'visits' in r and isinstance(r['visits'], list):
                 for v in r['visits']:
@@ -400,7 +521,48 @@ def fetch_page_count_all(overwrite: bool = False, base_url: str | None = None, a
             else:
                 flattened.append(r)
         rows = flattened
+    api_diag['rows_after_flatten'] = len(rows)
+
+    # Derive observed date set & ts range
+    observed_dates_set = set()
+    earliest_ts = None
+    latest_ts = None
+    for r in rows:
+        ts = r.get('timestamp') or r.get('event_ts') or r.get('time')
+        if ts:
+            dt_obj = _iso_date(str(ts))
+            if dt_obj:
+                observed_dates_set.add(dt_obj)
+            iso = str(ts)
+            if earliest_ts is None or iso < earliest_ts:
+                earliest_ts = iso
+            if latest_ts is None or iso > latest_ts:
+                latest_ts = iso
+    observed_dates = sorted(str(d) for d in observed_dates_set)
+    max_dt = max(observed_dates_set) if observed_dates_set else None
+    freshness_gap_days = (datetime.date.today() - max_dt).days if max_dt else None
+    zero_rows_reason = None
+    if len(rows) == 0:
+        if api_diag['attempted'] and api_diag['error']:
+            zero_rows_reason = 'api_error'
+        elif api_diag['attempted'] and api_diag['status_code'] and api_diag['status_code'] == 200:
+            zero_rows_reason = 'api_empty'
+        else:
+            zero_rows_reason = 'no_fallback_files'
+
     written = _write_rows_per_day(rows, out_base, 'page_count.csv', overwrite)
-    return {'source': 'page_count', 'mode': 'all', 'days': len(written), 'written': written}
+    return {
+        'source': 'page_count',
+        'mode': 'all',
+        'days': len(written),
+        'written': written,
+        'api': api_diag,
+        'fallback': fb_diag,
+        'observed_dates': observed_dates,
+        'earliest_ts': earliest_ts,
+        'latest_ts': latest_ts,
+        'freshness_gap_days': freshness_gap_days,
+        'zero_rows_reason': zero_rows_reason,
+    }
 
 __all__ = ['fetch_page_count_recent', 'fetch_search_logs_snapshot', 'fetch_page_count_all', 'fetch_search_logs_file']

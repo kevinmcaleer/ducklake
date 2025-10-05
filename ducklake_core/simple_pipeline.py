@@ -20,182 +20,9 @@ REPORTS_DIR = ROOT / 'reports'
 
 SOURCES = ['page_count', 'search_logs']
 
-REPORT_QUERIES = {
-  'page_views_by_agent_os_device.csv': '''
-    SELECT
-      agent_type,
-      os,
-      device,
-      count(*) AS view_count
-    FROM silver_page_count
-    GROUP BY 1,2,3
-    ORDER BY view_count DESC
-  ''',
-  'searches_weekly.csv': """
-    SELECT strftime(dt, '%G-W%V') AS iso_week, sum(cnt) AS search_count
-    FROM searches_daily
-    GROUP BY 1
-    ORDER BY 1
-  """,
-  'visits_pages_monthly.csv': """
-    SELECT strftime(dt, '%Y%m') AS yyyymm, sum(views) AS cnt
-    FROM page_views_daily
-    GROUP BY 1
-    ORDER BY 1
-  """,
-  'visits_pages_weekly.csv': """
-    SELECT strftime(dt, '%G-W%V') AS iso_week, sum(views) AS cnt
-    FROM page_views_daily
-    GROUP BY 1
-    ORDER BY 1
-  """,
-  'visits_pages_wow.csv': """
-    WITH weekly AS (
-      SELECT strftime(dt, '%G-W%V') AS iso_week, sum(views) AS week_cnt
-      FROM page_views_daily
-      GROUP BY 1
-    ),
-    wow AS (
-      SELECT iso_week, week_cnt,
-             lag(week_cnt) OVER (ORDER BY iso_week) AS prev_week,
-             week_cnt - lag(week_cnt) OVER (ORDER BY iso_week) AS delta,
-             CASE WHEN lag(week_cnt) OVER (ORDER BY iso_week) = 0 THEN NULL
-                  ELSE round(100.0 * (week_cnt - lag(week_cnt) OVER (ORDER BY iso_week)) / lag(week_cnt) OVER (ORDER BY iso_week), 2)
-             END AS pct_change
-      FROM weekly
-    )
-    SELECT iso_week, week_cnt, prev_week, delta, pct_change FROM wow ORDER BY iso_week
-  """,
-  'busiest_days_of_week.csv': """
-    SELECT strftime(dt, '%w') AS dow_num,
-           CASE strftime(dt, '%w') WHEN '0' THEN 'Sun' WHEN '1' THEN 'Mon' WHEN '2' THEN 'Tue' WHEN '3' THEN 'Wed' WHEN '4' THEN 'Thu' WHEN '5' THEN 'Fri' WHEN '6' THEN 'Sat' END AS dow,
-           sum(views) AS visits
-    FROM page_views_daily
-    GROUP BY 1,2
-    ORDER BY 1
-  """,
-  'busiest_hours_utc.csv': """
-    SELECT hour_utc, sum(views) AS cnt
-    FROM (
-      SELECT date_part('hour', timestamp) AS hour_utc, 1 AS views
-      FROM lake_page_count
-      WHERE timestamp IS NOT NULL
-    )
-    GROUP BY 1 ORDER BY 1
-  """,
-  'visits_pages_daily.csv': "SELECT dt, views AS cnt FROM page_views_daily ORDER BY dt",
-  'searches_daily.csv': "SELECT dt, query, cnt FROM searches_daily ORDER BY dt, cnt DESC",
-  # Top queries (normalized: lowercase + trimmed + collapsed internal whitespace)
-  'top_queries_all_time.csv': """
-    WITH norm AS (
-      SELECT lower(trim(regexp_replace(query, '\\s+', ' '))) AS query_norm, cnt
-      FROM searches_daily
-    )
-    SELECT query_norm AS query, sum(cnt) AS cnt
-    FROM norm
-    WHERE query_norm <> 'null'
-    GROUP BY 1 ORDER BY cnt DESC LIMIT 100
-  """,
-  'top_queries_30d.csv': """
-    WITH norm AS (
-      SELECT dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS query_norm, cnt
-      FROM searches_daily
-      WHERE dt >= current_date - INTERVAL 30 DAY
-    )
-    SELECT query_norm AS query, sum(cnt) AS cnt
-    FROM norm
-    WHERE query_norm <> 'null'
-    GROUP BY 1 ORDER BY cnt DESC LIMIT 100
-  """,
-  'top_queries_7d.csv': """
-    WITH norm AS (
-      SELECT dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS query_norm, cnt
-      FROM searches_daily
-      WHERE dt >= current_date - INTERVAL 7 DAY
-    )
-    SELECT query_norm AS query, sum(cnt) AS cnt
-    FROM norm
-    WHERE query_norm <> 'null'
-    GROUP BY 1 ORDER BY cnt DESC LIMIT 100
-  """,
-  'top_queries_3d.csv': """
-    WITH norm AS (
-      SELECT dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS query_norm, cnt
-      FROM searches_daily
-      WHERE dt >= current_date - INTERVAL 3 DAY
-    )
-    SELECT query_norm AS query, sum(cnt) AS cnt
-    FROM norm
-    WHERE query_norm <> 'null'
-    GROUP BY 1 ORDER BY cnt DESC LIMIT 100
-  """,
-  'searches_summary.csv': """
-    SELECT count(DISTINCT dt) AS days, count(*) AS query_day_rows, sum(cnt) AS total_searches,
-           count(DISTINCT query) AS distinct_queries
-    FROM searches_daily
-  """,
-  'searches_distinct_daily.csv': """
-    SELECT dt, count(DISTINCT query) AS distinct_queries, sum(cnt) AS searches
-    FROM searches_daily GROUP BY 1 ORDER BY 1
-  """,
-  'queries_quality.csv': """
-    WITH raw AS (
-      SELECT date(timestamp) AS dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS q
-      FROM lake_search_logs
-      WHERE timestamp IS NOT NULL AND query IS NOT NULL AND length(trim(query))>0
-    ), classified AS (
-      SELECT dt, q,
-             CASE
-               WHEN q IS NULL OR q='' THEN 'empty'
-               WHEN q='null' THEN 'literal_null'
-               WHEN length(q)=1 THEN 'single_char'
-               ELSE 'kept'
-             END AS quality
-      FROM raw
-    )
-    SELECT dt,
-           sum(CASE WHEN quality='kept' THEN 1 ELSE 0 END) AS kept_events,
-           sum(CASE WHEN quality!='kept' THEN 1 ELSE 0 END) AS excluded_events,
-           sum(CASE WHEN quality='literal_null' THEN 1 ELSE 0 END) AS literal_null_events,
-           sum(CASE WHEN quality='single_char' THEN 1 ELSE 0 END) AS single_char_events,
-           sum(CASE WHEN quality='empty' THEN 1 ELSE 0 END) AS empty_events,
-           COUNT(*) AS total_events,
-           round(100.0 * NULLIF(sum(CASE WHEN quality!='kept' THEN 1 ELSE 0 END),0) / NULLIF(COUNT(*),0),2) AS pct_excluded
-    FROM classified
-    GROUP BY 1
-    ORDER BY 1
-  """,
-  'searches_today.csv': """
-    SELECT date(l.timestamp) AS dt, l.timestamp, l.ip, lower(trim(l.query)) AS query
-    FROM lake_search_logs l
-    WHERE l.timestamp IS NOT NULL
-      AND date(l.timestamp) = current_date
-      AND l.query IS NOT NULL AND length(trim(l.query))>0
-    ORDER BY l.timestamp
-  """,
-  'searches_today_totals.csv': """
-    WITH today AS (
-      SELECT date(timestamp) AS dt, lower(trim(query)) AS query
-      FROM lake_search_logs
-      WHERE timestamp IS NOT NULL
-        AND date(timestamp) = current_date
-        AND query IS NOT NULL AND length(trim(query))>0
-    )
-    SELECT dt,
-           COUNT(*) AS raw_events,
-           COUNT(DISTINCT query) AS distinct_queries,
-           (SELECT COALESCE(sum(cnt),0) FROM searches_daily WHERE dt = current_date) AS aggregated_query_events,
-           (SELECT COALESCE(sum(cnt),0) FROM searches_daily) AS total_searches_all_time
-    FROM today
-    GROUP BY 1
-  """,
-  'searches_yesterday.csv': """ -- placeholder; dynamic SQL is injected in run_simple_reports
-    SELECT NULL WHERE FALSE
-  """,
-  'searches_yesterday_totals.csv': """ -- placeholder; dynamic SQL is injected in run_simple_reports
-    SELECT NULL WHERE FALSE
-  """,
-}
+# Reports are now generated from individual SQL files in sql/reports/
+# Each SQL file creates both a CSV report and a DuckDB view for dashboard integration
+SQL_REPORTS_DIR = ROOT / 'sql' / 'reports'
 
 
 def ensure_core_tables(conn: duckdb.DuckDBPyConnection):
@@ -427,12 +254,23 @@ def validate_simple_pipeline(conn: duckdb.DuckDBPyConnection) -> dict:
     checks['page_data_fresh'] = conn.execute("SELECT (julianday(current_date) - julianday(COALESCE(max(dt), DATE '1970-01-01'))) <= 7 FROM page_views_daily").fetchone()[0]
   except Exception:
     checks['page_data_fresh'] = None
+  # Earlier warning signals: compute lag days and a 1-day stale flag (lag>1)
+  try:
+    _lag_row = conn.execute("SELECT CAST(julianday(current_date) - julianday(COALESCE(max(dt), DATE '1970-01-01')) AS INT) FROM page_views_daily").fetchone()
+    lag_days = _lag_row[0] if _lag_row and len(_lag_row) else None
+  except Exception:
+    lag_days = None
+  checks['page_data_lag_days'] = lag_days
+  if isinstance(lag_days, int):
+    checks['page_data_stale_1d'] = (lag_days > 1)
+  else:
+    checks['page_data_stale_1d'] = None
   (REPORTS_DIR / 'simple_validation.json').write_text(json.dumps(checks, indent=2, default=str))
   return checks
 
 
 def _dynamic_busiest_hours_sql(conn: duckdb.DuckDBPyConnection):
-  # Determine an available time column in lake_page_count
+  """Generate busiest hours SQL with dynamic column detection."""
   try:
     cols = [r[0] for r in conn.execute("DESCRIBE lake_page_count").fetchall()]
   except Exception:
@@ -449,88 +287,93 @@ def _dynamic_busiest_hours_sql(conn: duckdb.DuckDBPyConnection):
   return None
 
 
+def load_sql_reports() -> dict[str, str]:
+  """Load all SQL report files and return dict mapping report name to SQL content."""
+  reports = {}
+  if not SQL_REPORTS_DIR.exists():
+    return reports
+  
+  for sql_file in SQL_REPORTS_DIR.glob('*.sql'):
+    report_name = sql_file.stem
+    try:
+      sql_content = sql_file.read_text().strip()
+      # Remove comments for cleaner SQL
+      lines = []
+      for line in sql_content.split('\n'):
+        if not line.strip().startswith('--'):
+          lines.append(line)
+      clean_sql = '\n'.join(lines).strip()
+      
+      # Remove trailing semicolon if present (DuckDB COPY doesn't like it)
+      if clean_sql.endswith(';'):
+        clean_sql = clean_sql[:-1].strip()
+      
+      if clean_sql:
+        reports[report_name] = clean_sql
+    except Exception as e:
+      print(f"[WARN] Failed to load SQL report {sql_file}: {e}")
+  
+  return reports
+
+
+def create_report_view(conn: duckdb.DuckDBPyConnection, report_name: str, sql: str) -> bool:
+  """Create a DuckDB view for the report for dashboard integration."""
+  view_name = f"v_{report_name}"
+  try:
+    conn.execute(f"CREATE OR REPLACE VIEW {view_name} AS {sql}")
+    return True
+  except Exception as e:
+    print(f"[WARN] Failed to create view {view_name}: {e}")
+    return False
+
+
 def run_simple_reports(conn: duckdb.DuckDBPyConnection):
   REPORTS_DIR.mkdir(parents=True, exist_ok=True)
   out = {}
-  for fname, sql in REPORT_QUERIES.items():
-    target = REPORTS_DIR / fname
+  views_created = {}
+  
+  # Load all SQL reports from files
+  sql_reports = load_sql_reports()
+  
+  for report_name, sql in sql_reports.items():
+    csv_filename = f"{report_name}.csv"
+    target = REPORTS_DIR / csv_filename
     effective_sql = sql
-    if fname == 'busiest_hours_utc.csv':
+    
+    # Handle special cases that need dynamic column detection
+    if report_name == 'busiest_hours_utc':
       dyn = _dynamic_busiest_hours_sql(conn)
       if dyn is None:
-        # Write empty header file and continue
         target.write_text('hour_utc,cnt\n')
-        out[fname] = 0
+        out[csv_filename] = 0
+        views_created[f"v_{report_name}"] = False
         continue
       effective_sql = dyn
-    elif fname in ('searches_today.csv','searches_today_totals.csv','searches_yesterday.csv','searches_yesterday_totals.csv'):
-      # Determine a usable time column for searches today reports
-      try:
-        cols = [r[0] for r in conn.execute("DESCRIBE lake_search_logs").fetchall()]
-      except Exception:
-        cols = []
-      time_col = None
-      for c in ('timestamp','event_ts','time','dt'):
-        if c in cols:
-          time_col = c
-          break
-      if time_col is None:
-        # emit empty files with headers
-        if fname in ('searches_today.csv','searches_yesterday.csv'):
-          target.write_text('dt,timestamp,ip,query\n')
-        else:
-          target.write_text('dt,raw_events,distinct_queries,aggregated_query_events,total_searches_all_time\n')
-        out[fname] = 0
-        continue
-      is_today = fname in ('searches_today.csv','searches_today_totals.csv')
-      date_expr = "current_date" if is_today else "current_date - INTERVAL 1 DAY"
-      if fname in ('searches_today.csv','searches_yesterday.csv'):
-        effective_sql = f"""
-          SELECT date(l.{time_col}) AS dt, l.{time_col} AS timestamp, l.ip,
-                 lower(trim(regexp_replace(l.query, '\\s+', ' '))) AS query
-          FROM lake_search_logs l
-          WHERE l.{time_col} IS NOT NULL
-            AND date(l.{time_col}) = {date_expr}
-            AND l.query IS NOT NULL AND length(trim(l.query))>0
-            AND lower(trim(l.query)) <> 'null'
-            AND length(lower(trim(regexp_replace(l.query, '\\s+', ' ')))) > 1
-          ORDER BY l.{time_col}
-        """
-      else:
-        effective_sql = f"""
-          WITH d AS (
-            SELECT date({time_col}) AS dt,
-                   lower(trim(regexp_replace(query, '\\s+', ' '))) AS query
-            FROM lake_search_logs
-            WHERE {time_col} IS NOT NULL
-              AND date({time_col}) = {date_expr}
-              AND query IS NOT NULL AND length(trim(query))>0
-              AND lower(trim(query)) <> 'null'
-              AND length(lower(trim(regexp_replace(query, '\\s+', ' ')))) > 1
-          )
-          SELECT dt,
-                 COUNT(*) AS raw_events,
-                 COUNT(DISTINCT query) AS distinct_queries,
-                 (SELECT COALESCE(sum(cnt),0) FROM searches_daily WHERE dt = {date_expr}) AS aggregated_query_events,
-                 (SELECT COALESCE(sum(cnt),0) FROM searches_daily) AS total_searches_all_time
-          FROM d
-          GROUP BY 1
-        """
+    
     try:
+      # Create CSV report
       conn.execute(f"COPY ({effective_sql}) TO '{target}' (HEADER TRUE, DELIMITER ',')")
       rows = sum(1 for _ in target.open()) - 1 if target.exists() else 0
-      out[fname] = rows
+      out[csv_filename] = rows
+      
+      # Create DuckDB view for dashboard integration
+      view_created = create_report_view(conn, report_name, effective_sql)
+      views_created[f"v_{report_name}"] = view_created
+      
     except Exception as e:
-      # Fallback: create empty CSV with generic header if possible
-      print(f"[WARN] report {fname} failed: {e}")
+      print(f"[WARN] report {csv_filename} failed: {e}")
       if not target.exists():
-        # naive header inference: if SELECT dt in sql choose dt,cnt else generic
-        if 'hour_utc' in sql:
-          target.write_text('hour_utc,cnt\n')
-        else:
-          target.write_text('col\n')
-      out[fname] = 0
-  (REPORTS_DIR / 'simple_refresh_summary.json').write_text(json.dumps({'generated': out, 'ts': datetime.utcnow().isoformat()+'Z'}, indent=2))
+        target.write_text('col\n')  # Generic fallback header
+      out[csv_filename] = 0
+      views_created[f"v_{report_name}"] = False
+  
+  # Generate summary with both CSV and view information
+  summary = {
+    'generated_reports': out,
+    'created_views': views_created,
+    'ts': datetime.utcnow().isoformat()+'Z'
+  }
+  (REPORTS_DIR / 'simple_refresh_summary.json').write_text(json.dumps(summary, indent=2))
 
 
 def simple_refresh(conn: duckdb.DuckDBPyConnection):

@@ -1,0 +1,9 @@
+- simplicity over complexity
+- clarity over cleverness
+- maintainability over optimization
+- self-documenting code over comments
+- small functions over large functions
+- functions with single responsibility over multi-purpose functions
+- sql should be stored in .sql files over inline sql
+- new functions should have tests over no tests
+- code coverage should be at least 80%

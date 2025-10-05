@@ -37,6 +37,54 @@ from ducklake_core.fetch_raw import (
     fetch_page_count_all,
     fetch_search_logs_file,
 )
+from ducklake_core.export_reports import export_reports_command
+
+
+# ------------------------
+# Helper utilities
+# ------------------------
+def print_result(obj: dict, use_json: bool):
+    """Uniform output printer. If timings present, format them nicely in text mode.
+    Always stable: callers pass a dict.
+    """
+    if use_json:
+        print(json.dumps(obj, indent=2, default=str))
+        return
+    if 'timings' in obj:
+        base = {k: v for k, v in obj.items() if k != 'timings'}
+        for k, v in base.items():
+            if isinstance(v, dict):
+                print(f"{k}:")
+                for sk, sv in v.items():
+                    print(f"  {sk}: {sv}")
+            else:
+                print(f"{k}: {v}")
+        print("timings:")
+        for tk, tv in obj['timings'].items():
+            print(f"  {tk}: {tv}")
+    else:
+        print(obj)
+
+
+def maybe_auto_fetch_page_count(args) -> dict | None:
+    """Perform optional auto-fetch for page_count based on --auto-fetch-days.
+    Returns a result dict or None. Never raises.
+    """
+    afd = getattr(args, 'auto_fetch_days', None)
+    if not afd:
+        return None
+    try:
+        if str(afd).lower() == 'all':
+            print("[auto-fetch] fetching ALL page_count history before refresh")
+            return fetch_page_count_all(overwrite=False)
+        days = int(afd)
+        if days <= 0:
+            return None
+        print(f"[auto-fetch] fetching last {days} day(s) of page_count before refresh")
+        return fetch_page_count_recent(days, overwrite=False)
+    except Exception as e:
+        print(f"[auto-fetch] warning: failed auto fetch ({e})", file=sys.stderr)
+        return None
 
 
 def _connect(path: str):
@@ -106,53 +154,53 @@ def _reimport_last_days(con: duckdb.DuckDBPyConnection, args: argparse.Namespace
 
 def cmd_refresh(args: argparse.Namespace) -> int:
     con = _connect(args.db)
-    auto_fetch_result = None
-    # Optional auto-fetch integration (page_count only for now)
-    if getattr(args, 'auto_fetch_days', None):
-        afd = args.auto_fetch_days
-        try:
-            if str(afd).lower() == 'all':
-                print("[auto-fetch] fetching ALL page_count history before refresh")
-                auto_fetch_result = fetch_page_count_all(overwrite=False)
-            else:
-                days = int(afd)
-                if days <= 0:
-                    raise ValueError
-                print(f"[auto-fetch] fetching last {days} day(s) of page_count before refresh")
-                auto_fetch_result = fetch_page_count_recent(days, overwrite=False)
-        except Exception as e:
-            print(f"[auto-fetch] warning: failed auto fetch ({e})", file=sys.stderr)
+    auto_fetch_result = maybe_auto_fetch_page_count(args)
     if args.force:
         _force_cleanup(con, args)
     if args.reimport_last_days:
         _reimport_last_days(con, args)
     result = simple_refresh(con)
-    if auto_fetch_result is not None:
-        result['auto_fetch'] = auto_fetch_result
-    if args.json:
-        print(json.dumps(result, indent=2, default=str))
-    else:
-        print("Simple refresh complete:")
-        for k, v in result.items():
-            if k == 'timings':
-                print("  timings:")
-                for tk, tv in v.items():
-                    print(f"    {tk}: {tv}")
+    # Always include auto_fetch key for stable schema
+    result['auto_fetch'] = auto_fetch_result
+
+    # Close connection before export to avoid lock conflicts
+    con.close()
+
+    # Auto-export to Metabase if --export-metabase flag is set
+    export_result = None
+    if args.export_metabase:
+        try:
+            print("[export] Exporting to Metabase-compatible format...")
+            import subprocess
+            export_script = pathlib.Path(__file__).parent / "export_for_metabase.sh"
+            proc_result = subprocess.run([str(export_script)], capture_output=True, text=True)
+            if proc_result.returncode == 0:
+                print(proc_result.stdout)
+                export_result = {"status": "success", "output": "reports.duckdb"}
             else:
-                print(f"  {k}: {v}")
+                print(f"[export] Warning: Failed to export to Metabase format", file=sys.stderr)
+                print(f"[export] stdout: {proc_result.stdout}", file=sys.stderr)
+                print(f"[export] stderr: {proc_result.stderr}", file=sys.stderr)
+                export_result = {"status": "failed", "error": proc_result.stderr}
+        except subprocess.CalledProcessError as e:
+            print(f"[export] Warning: Failed to export to Metabase format", file=sys.stderr)
+            print(f"[export] Error output: {e.stderr}", file=sys.stderr)
+            export_result = {"status": "failed", "error": str(e)}
+        except Exception as e:
+            print(f"[export] Warning: Failed to export to Metabase format: {e}", file=sys.stderr)
+            export_result = {"status": "failed", "error": str(e)}
+
+    result['metabase_export'] = export_result
+    print_result(result, args.json)
     return 0
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
-    # Pre-flight snapshot file existence check for clearer error
     snap_path = pathlib.Path(args.snapshot)
     if not snap_path.exists():
         msg = f"[snapshot] file not found: {args.snapshot}. Create it or provide the correct --snapshot path."
-        # Respect json flag (subcommand-level) for error formatting
-        if args.json:
-            print(json.dumps({"error": msg, "snapshot": str(snap_path)}, indent=2))
-        else:
-            print(msg, file=sys.stderr)
+        payload = {"error": msg, "snapshot": str(snap_path)}
+        print_result(payload, args.json)
         return 1
     con = _connect(args.db)
     snap_res = incremental_snapshot_ingest(
@@ -162,12 +210,9 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         time_col=args.time_col,
         quality=not args.no_quality,
     )
-    if not args.no_refresh:
-        ref = simple_refresh(con)
-    else:
-        ref = None
-    out = {"snapshot": snap_res, "refresh": ref}
-    print(json.dumps(out, indent=2, default=str) if args.json else out)
+    ref = None if args.no_refresh else simple_refresh(con)
+    out = {"snapshot": snap_res, "refresh": ref, "auto_fetch": None}
+    print_result(out, args.json)
     return 0
 
 
@@ -222,25 +267,33 @@ def cmd_reset(args: argparse.Namespace) -> int:
             print(f"[reset] failed removing raw dir {RAW_DIR}: {e}")
             removed['raw'] = False
     # Summary JSON
-    summary = {'reset': removed, 'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
-    print(json.dumps(summary, indent=2))
+    summary = {'reset': removed, 'ts': datetime.datetime.utcnow().isoformat() + 'Z', 'auto_fetch': None}
+    print_result(summary, True)  # reset output is always JSON-like
     return 0
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
     results = {}
-    if 'page_count' in args.sources or 'all' in args.sources:
-        results['page_count'] = fetch_page_count_recent(args.days, overwrite=args.overwrite, base_url=args.page_count_url, api_key=args.page_count_key, fallback_dir=pathlib.Path(args.fallback_dir) if args.fallback_dir else None)
-    if 'search_logs' in args.sources or 'all' in args.sources:
-        results['search_logs'] = fetch_search_logs_snapshot(snapshot_url=args.search_logs_url, overwrite=args.overwrite, base_url=args.search_logs_url, api_key=args.search_logs_key)
-    if args.refresh:
-        # Run a refresh after fetching
-        con = _connect(args.db)
-        ref = simple_refresh(con)
-    else:
-        ref = None
-    payload = {'fetched': results, 'refresh': ref}
-    print(json.dumps(payload, indent=2, default=str) if args.json else payload)
+    # Default behavior: if --sources omitted, fetch both sources
+    sources = args.sources if args.sources is not None else ['page_count', 'search_logs']
+    if 'page_count' in sources or 'all' in sources:
+        results['page_count'] = fetch_page_count_recent(
+            args.days,
+            overwrite=args.overwrite,
+            base_url=args.page_count_url,
+            api_key=args.page_count_key,
+            fallback_dir=pathlib.Path(args.fallback_dir) if args.fallback_dir else None,
+        )
+    if 'search_logs' in sources or 'all' in sources:
+        results['search_logs'] = fetch_search_logs_snapshot(
+            snapshot_url=args.search_logs_url,
+            overwrite=args.overwrite,
+            base_url=args.search_logs_url,
+            api_key=args.search_logs_key,
+        )
+    ref = simple_refresh(_connect(args.db)) if args.refresh else None
+    payload = {'fetched': results, 'refresh': ref, 'auto_fetch': None}
+    print_result(payload, args.json)
     return 0
 
 
@@ -261,8 +314,20 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         ref = simple_refresh(con)
     else:
         ref = None
-    payload = {'backfill': results, 'refresh': ref}
-    print(json.dumps(payload, indent=2, default=str) if args.json else payload)
+    payload = {'backfill': results, 'refresh': ref, 'auto_fetch': None}
+    print_result(payload, args.json)
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Export all tables and views to a reporting database for Metabase."""
+    result = export_reports_command(
+        args.db,
+        output_path=args.output,
+        json_output=args.json
+    )
+    if args.json:
+        print_result(result, True)
     return 0
 
 
@@ -279,6 +344,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force-sources", nargs="*", default=None, help="Subset of sources to force (default: all)")
     p.add_argument("--rebuild-lake", action="store_true", help="When forcing, delete lake parquet partitions for affected sources before ingest")
     p.add_argument("--reimport-last-days", type=int, default=0, help="Re-import only the last N days (clears processed_files rows and lake partitions for those days)")
+    p.add_argument("--export-metabase", action="store_true", help="After refresh, automatically export to reports.duckdb for Metabase (DuckDB 1.3.1 format)")
 
     # Subcommand: snapshot
     sp = sub.add_parser("snapshot", help="Run incremental snapshot ingest then refresh")
@@ -296,8 +362,8 @@ def build_parser() -> argparse.ArgumentParser:
     rp.set_defaults(func=cmd_reset)
 
     # Subcommand: fetch (download raw then optional refresh)
-    fp = sub.add_parser("fetch", help="Fetch raw source data (recent/page_count, snapshot search logs) then optional refresh")
-    fp.add_argument("--sources", nargs="+", default=["all"], help="Sources to fetch: page_count search_logs all")
+    fp = sub.add_parser("fetch", help="Fetch raw source data (recent page_count + search logs snapshot) then optional refresh (defaults to all sources)")
+    fp.add_argument("--sources", nargs="+", default=None, help="Subset of sources to fetch (default: both page_count and search_logs). Accepts: page_count search_logs all")
     fp.add_argument("--days", type=int, default=1, help="Recent days to fetch for page_count")
     fp.add_argument("--page-count-url", help="Override PAGE_COUNT_API_URL")
     fp.add_argument("--page-count-key", help="API key for page_count endpoint")
@@ -321,6 +387,12 @@ def build_parser() -> argparse.ArgumentParser:
     bp.add_argument("--no-refresh", action="store_true", help="Skip running simple_refresh after backfill")
     bp.add_argument("--json", action="store_true", help="JSON output (overrides top-level flag)")
     bp.set_defaults(func=cmd_backfill)
+
+    # Subcommand: export (export tables and views to reporting database)
+    ep = sub.add_parser("export", help="Export all tables and views to a reporting database for Metabase")
+    ep.add_argument("--output", default="reports.duckdb", help="Output database path (default: reports.duckdb)")
+    ep.add_argument("--json", action="store_true", help="JSON output (overrides top-level flag)")
+    ep.set_defaults(func=cmd_export)
 
     p.set_defaults(func=cmd_refresh)
     return p
