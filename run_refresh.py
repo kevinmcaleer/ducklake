@@ -153,12 +153,14 @@ def _reimport_last_days(con: duckdb.DuckDBPyConnection, args: argparse.Namespace
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
+    print("[progress] Starting refresh...", file=sys.stderr, flush=True)
     con = _connect(args.db)
     auto_fetch_result = maybe_auto_fetch_page_count(args)
     if args.force:
         _force_cleanup(con, args)
     if args.reimport_last_days:
         _reimport_last_days(con, args)
+    print("[progress] Running pipeline refresh...", file=sys.stderr, flush=True)
     result = simple_refresh(con)
     # Always include auto_fetch key for stable schema
     result['auto_fetch'] = auto_fetch_result
@@ -273,6 +275,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
+    print("[progress] Starting fetch...", file=sys.stderr, flush=True)
     results = {}
     # Default behavior: if --sources omitted, fetch both sources
     sources = args.sources if args.sources is not None else ['page_count', 'search_logs']
@@ -291,6 +294,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             base_url=args.search_logs_url,
             api_key=args.search_logs_key,
         )
+    if args.refresh:
+        print("[progress] Running pipeline refresh...", file=sys.stderr, flush=True)
     ref = simple_refresh(_connect(args.db)) if args.refresh else None
     payload = {'fetched': results, 'refresh': ref, 'auto_fetch': None}
     print_result(payload, args.json)
@@ -303,6 +308,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     Page count: attempts API full export (all=1) else consumes every local JSONL archive.
     Search logs: if --search-logs-url provided we treat it as a full snapshot and ingest per-day.
     """
+    print("[progress] Starting backfill...", file=sys.stderr, flush=True)
     results = {}
     results['page_count'] = fetch_page_count_all(overwrite=args.overwrite, base_url=args.page_count_url, api_key=args.page_count_key, fallback_dir=pathlib.Path(args.fallback_dir) if args.fallback_dir else None)
     if args.search_logs_url:
@@ -310,6 +316,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     elif args.search_logs_file:
         results['search_logs'] = fetch_search_logs_file(args.search_logs_file, overwrite=args.overwrite)
     if not args.no_refresh:
+        print("[progress] Running pipeline refresh...", file=sys.stderr, flush=True)
         con = _connect(args.db)
         ref = simple_refresh(con)
     else:

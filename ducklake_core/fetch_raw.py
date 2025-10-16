@@ -1,4 +1,4 @@
-import os, json, pathlib, datetime, requests, csv, re
+import os, json, pathlib, datetime, requests, csv, re, sys
 from urllib.parse import urlparse, parse_qs, unquote
 from .simple_pipeline import RAW_DIR
 
@@ -14,6 +14,12 @@ SEARCH_LOGS_ENV_URL = 'SEARCH_LOGS_API_URL'
 SEARCH_LOGS_ENV_KEY = 'SEARCH_LOGS_API_KEY'
 
 
+def _progress(msg: str, quiet: bool = False):
+    """Print progress message to stderr unless quiet mode."""
+    if not quiet:
+        print(f"[progress] {msg}", file=sys.stderr, flush=True)
+
+
 def _iso_date(ts: str):
     try:
         return datetime.datetime.fromisoformat(ts.replace('Z','+00:00')).date()
@@ -24,7 +30,8 @@ def _iso_date(ts: str):
             return None
 
 
-def _write_rows_per_day(rows, out_base: pathlib.Path, filename: str, overwrite: bool):
+def _write_rows_per_day(rows, out_base: pathlib.Path, filename: str, overwrite: bool, quiet: bool = False):
+    _progress(f"Grouping {len(rows)} rows by date...", quiet)
     by_day = {}
     for r in rows:
         ts = r.get('timestamp') or r.get('event_ts') or r.get('time')
@@ -32,6 +39,7 @@ def _write_rows_per_day(rows, out_base: pathlib.Path, filename: str, overwrite: 
         if not dt:
             continue
         by_day.setdefault(dt, []).append(r)
+    _progress(f"Writing {len(by_day)} daily partitions...", quiet)
     out_summary = {}
     for dt, day_rows in by_day.items():
         dt_dir = out_base / f'dt={dt}'
@@ -64,6 +72,7 @@ def fetch_page_count_recent(days: int, overwrite: bool = False, base_url: str | 
       - freshness_gap_days: (today - max(observed_date)) if any rows else None
       - zero_rows_reason when 0 rows (api_empty | api_error | no_fallback_files)
     """
+    _progress(f"Fetching page_count for last {days} day(s)...")
     base_url = base_url or os.getenv(PAGE_COUNT_ENV_URL) or DEFAULT_PAGE_COUNT_BASE_URL
     api_key = api_key or os.getenv(PAGE_COUNT_ENV_KEY)
     out_base = RAW_DIR / 'page_count'
@@ -96,6 +105,7 @@ def fetch_page_count_recent(days: int, overwrite: bool = False, base_url: str | 
                 break
             api_diag['attempted'] = True
             api_diag['attempted_urls'].append(attempt_url)
+            _progress(f"Requesting page_count from API...")
             try:
                 resp = requests.get(attempt_url, headers=headers, timeout=60)
                 api_diag['status_code'] = resp.status_code
@@ -121,6 +131,7 @@ def fetch_page_count_recent(days: int, overwrite: bool = False, base_url: str | 
     api_diag['rows_before_flatten'] = len(rows)
     # Flatten wrapper objects like {"visits": [...]} if present
     if rows:
+        _progress(f"Processing {len(rows)} page_count records...")
         flattened: list[dict] = []
         for r in rows:
             if isinstance(r, dict) and 'visits' in r and isinstance(r['visits'], list):
@@ -139,6 +150,7 @@ def fetch_page_count_recent(days: int, overwrite: bool = False, base_url: str | 
         'files_loaded': 0,
     }
     if not rows:
+        _progress("No API data, checking fallback files...")
         fb = fallback_dir or DEFAULT_TMP_DOWNLOADS
         fb_diag['dir'] = str(fb)
         if fb.exists():
@@ -217,16 +229,19 @@ def fetch_search_logs_snapshot(snapshot_url: str | None = None, overwrite: bool 
 
     Writes per-day CSV partitions using timestamp/event_ts/time detection.
     """
+    _progress("Fetching search_logs snapshot...")
     base_url = snapshot_url or base_url or os.getenv(SEARCH_LOGS_ENV_URL)
     api_key = api_key or os.getenv(SEARCH_LOGS_ENV_KEY)
     out_base = RAW_DIR / 'search_logs'
     out_base.mkdir(parents=True, exist_ok=True)
     rows = []
     if base_url:
+        _progress(f"Requesting search_logs from API...")
         headers = {'Authorization': f"Bearer {api_key}"} if api_key else {}
         try:
             resp = requests.get(base_url, headers=headers, timeout=120)
             resp.raise_for_status()
+            _progress(f"Processing search_logs response...")
             txt = resp.text.strip()
             if txt.startswith('['):
                 data = resp.json()
@@ -258,6 +273,7 @@ def fetch_search_logs_file(path: str, overwrite: bool = False, assume_utc: bool 
 
     Returns detailed counters for diagnostics.
     """
+    _progress(f"Parsing search logs from file: {path}")
     file_path = pathlib.Path(path)
     out_base = RAW_DIR / 'search_logs'
     out_base.mkdir(parents=True, exist_ok=True)
@@ -291,8 +307,13 @@ def fetch_search_logs_file(path: str, overwrite: bool = False, assume_utc: bool 
     skipped_no_ts = 0
     skipped_no_query = 0
 
-    for raw_line in file_path.read_text(errors='ignore').splitlines():
+    _progress(f"Reading search logs file...")
+    lines = file_path.read_text(errors='ignore').splitlines()
+    _progress(f"Parsing {len(lines)} lines from search logs...")
+    for raw_line in lines:
         total += 1
+        if total % 1000 == 0:
+            _progress(f"Parsed {parsed} records from {total} lines...")
         line = raw_line.strip()
         if not line:
             continue
@@ -423,6 +444,7 @@ def fetch_page_count_all(overwrite: bool = False, base_url: str | None = None, a
 
     Diagnostics similar to fetch_page_count_recent (without expected_recent_dates) to aid full backfill troubleshooting.
     """
+    _progress("Fetching ALL page_count history...")
     base_url = base_url or os.getenv(PAGE_COUNT_ENV_URL) or DEFAULT_PAGE_COUNT_BASE_URL
     api_key = api_key or os.getenv(PAGE_COUNT_ENV_KEY)
     out_base = RAW_DIR / 'page_count'
@@ -454,6 +476,7 @@ def fetch_page_count_all(overwrite: bool = False, base_url: str | None = None, a
                 break
             api_diag['attempted'] = True
             api_diag['attempted_urls'].append(attempt_url)
+            _progress(f"Requesting full page_count history from API (may take a while)...")
             try:
                 resp = requests.get(attempt_url, headers=headers, timeout=180)
                 api_diag['status_code'] = resp.status_code

@@ -9,6 +9,33 @@ data/raw/<source>/dt=YYYY-MM-DD/*.csv  ->  data/lake/<source>/dt=YYYY-MM-DD.parq
 
 Enrichment: A silver-style view (`silver_page_count`) is built inline, parsing `user_agent` strings into device / OS / browser / bot fields for reporting.
 
+## TLDR: Quick Fetch & Update
+
+**Fetch latest data from both sources (last 3 days) and update reports:**
+```bash
+python run_refresh.py --db contentlake.ducklake fetch --days 3 --refresh --json
+```
+
+**Fetch only page_count (recent visits):**
+```bash
+python run_refresh.py --db contentlake.ducklake fetch --sources page_count --days 3 --refresh --json
+```
+
+**Fetch only search_logs:**
+```bash
+python run_refresh.py --db contentlake.ducklake fetch --sources search_logs --refresh --json
+```
+
+**Update reports from existing data (no fetch):**
+```bash
+python run_refresh.py --db contentlake.ducklake --json
+```
+
+**Auto-fetch page_count when running refresh (if data is missing):**
+```bash
+python run_refresh.py --db contentlake.ducklake --auto-fetch-days 2 --json
+```
+
 ## Key Directories
 ```
 data/raw/            # Input CSVs (partitioned by dt=... folders)

@@ -381,8 +381,10 @@ def simple_refresh(conn: duckdb.DuckDBPyConnection):
   t0 = time.time()
   phases = {}
   # Ingest
+  print("[progress] Ingesting new files...", file=sys.stderr, flush=True)
   p0 = time.time(); new_files = ingest_new_files(conn); phases['ingest_s'] = round(time.time()-p0, 3)
   # Lake views
+  print("[progress] Creating lake views...", file=sys.stderr, flush=True)
   p0 = time.time(); create_lake_views(conn); phases['lake_views_s'] = round(time.time()-p0, 3)
   # Silver enrichment (user_agent parsing) for page_count via pandas
   p0 = time.time()
@@ -483,13 +485,18 @@ def simple_refresh(conn: duckdb.DuckDBPyConnection):
     print(f"[WARN] Silver enrichment failed: {e}")
   phases['silver_enrich_s'] = round(time.time()-p0, 3)
   # Aggregates
+  print("[progress] Updating daily aggregates...", file=sys.stderr, flush=True)
   p0 = time.time(); update_daily_aggregates(conn); phases['aggregates_s'] = round(time.time()-p0, 3)
   # Reports
+  print("[progress] Generating reports...", file=sys.stderr, flush=True)
   p0 = time.time(); run_simple_reports(conn); phases['reports_s'] = round(time.time()-p0, 3)
   # Validation
+  print("[progress] Validating pipeline...", file=sys.stderr, flush=True)
   p0 = time.time(); validate = validate_simple_pipeline(conn); phases['validation_s'] = round(time.time()-p0, 3)
   # Anomaly detection (does not modify state)
+  print("[progress] Detecting anomalies...", file=sys.stderr, flush=True)
   p0 = time.time(); anomalies = detect_anomalies(conn); phases['anomaly_s'] = round(time.time()-p0, 3)
+  print("[progress] Refresh complete!", file=sys.stderr, flush=True)
   total = round(time.time() - t0, 3)
   phases['total_s'] = total
   return {
