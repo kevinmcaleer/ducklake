@@ -7,6 +7,7 @@ import duckdb
 from datetime import datetime, date, timedelta
 from typing import Any
 import re
+from .ip_geolocation import IPGeolocator, get_country_name
 
 
 def extract_page_type(url: str) -> str:
@@ -233,6 +234,42 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
             SELECT SUM(cnt) FROM searches_daily WHERE dt >= ?
         """, [month_ago]).fetchone()[0] or 0
 
+        # 10. Country breakdown (from IP geolocation)
+        country_counts = {}
+        try:
+            with IPGeolocator() as geolocator:
+                # Get unique IPs from last month with visit counts
+                ip_visits = con.execute("""
+                    SELECT ip, COUNT(*) as visits
+                    FROM lake_page_count
+                    WHERE dt >= ? AND ip IS NOT NULL AND ip != ''
+                    GROUP BY ip
+                """, [month_ago]).fetchall()
+
+                print(f"Looking up countries for {len(ip_visits):,} unique IPs...")
+
+                # Lookup countries for each IP
+                for ip, visits in ip_visits:
+                    country_code = geolocator.lookup(ip)
+                    if country_code:
+                        country_name = get_country_name(country_code)
+                        country_counts[country_name] = country_counts.get(country_name, 0) + visits
+                    else:
+                        country_counts['Unknown'] = country_counts.get('Unknown', 0) + visits
+
+                print(f"Found {len(country_counts)} countries")
+
+        except Exception as e:
+            print(f"Warning: Could not generate country breakdown: {e}")
+            country_counts = {'Unknown': total_visits}
+
+        # Sort countries by visit count
+        country_breakdown = sorted(
+            [{"country": country, "visits": count} for country, count in country_counts.items()],
+            key=lambda x: x['visits'],
+            reverse=True
+        )[:20]  # Top 20 countries
+
         # Format results
         return {
             "last_updated": datetime.now().astimezone().isoformat(),
@@ -276,6 +313,7 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
                 for url, visits in popular_pages
             ],
             "page_type_breakdown": page_type_counts,
+            "country_breakdown": country_breakdown,
             "user_stats": {
                 "new_users": new_users,
                 "returning_users": returning_users,

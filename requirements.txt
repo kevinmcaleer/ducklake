@@ -12,3 +12,4 @@ apscheduler
 psycopg2-binary
 python-dotenv
 python-dateutil
+geoip2
