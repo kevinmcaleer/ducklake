@@ -5,7 +5,7 @@ services:
     build: .
     container_name: ducklake-analytics
     ports:
-      - "8002:8000"  # Map container port 8000 to host port 8002
+      - "8008:8008"  # Map container port 8008 to host port 8008
     environment:
       # DuckDB configuration
       - DUCKDB_PATH=/app/contentlake.ducklake
@@ -23,7 +23,7 @@ services:
 
       # API configuration
       - HOST=0.0.0.0
-      - PORT=8000
+      - PORT=8008
     volumes:
       # Persist DuckDB database and data
       - ./data:/app/data
@@ -32,7 +32,7 @@ services:
       - ./reports:/app/reports
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8008/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
