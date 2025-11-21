@@ -45,6 +45,8 @@ app.add_middleware(
         "https://www.kevsrobots.com",
         "https://kevsrobots.com",
         "http://localhost:4000",  # For local Jekyll testing
+        "http://local.kevsrobots.com:4000",  # For local development
+        "http://127.0.0.1:4000",  # Alternative localhost
     ],
     allow_credentials=False,
     allow_methods=["GET"],
