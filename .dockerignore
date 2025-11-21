@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# DuckDB files (will be volume-mounted)
+*.ducklake
+*.duckdb
+
+# Data directories (will be volume-mounted)
+data/
+reports/
+dashboard_data.json
+_tmp_downloads/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+README.md
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+design/
+*.md
+
+# OS
+.DS_Store
+Thumbs.db

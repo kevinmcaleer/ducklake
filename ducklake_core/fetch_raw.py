@@ -2,6 +2,18 @@ import os, json, pathlib, datetime, requests, csv, re, sys
 from urllib.parse import urlparse, parse_qs, unquote
 from .simple_pipeline import RAW_DIR
 
+try:
+    import psycopg2
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 DEFAULT_TMP_DOWNLOADS = pathlib.Path('_tmp_downloads')
 
 PAGE_COUNT_ENV_URL = 'PAGE_COUNT_API_URL'  # Expected base URL e.g. https://example/api/page_count
@@ -92,41 +104,32 @@ def fetch_page_count_recent(days: int, overwrite: bool = False, base_url: str | 
     }
     if base_url:
         headers = {'Authorization': f"Bearer {api_key}"} if api_key else {}
-        # Attempt strategy hierarchy:
-        # 1) range={days}d with since = earliest expected date (oldest) -> expects list or JSONL
-        # 2) fallback to recent=days (legacy)
-        earliest_expected = expected_recent_dates[0]
-        candidate_urls = [
-            f"{base_url}?range={days}d&since={earliest_expected}",
-            (f"{base_url}?recent={days}" if 'recent=' not in base_url else base_url),
-        ]
-        for attempt_url in candidate_urls:
-            if rows:  # stop after first success with rows
-                break
-            api_diag['attempted'] = True
+        # Fetch incrementally day-by-day to avoid timeouts on large datasets
+        # Use start_date/end_date with format=jsonl for efficiency
+        api_diag['attempted'] = True
+        for i, date_str in enumerate(expected_recent_dates):
+            # Each request fetches a single day (start_date = end_date)
+            attempt_url = f"{base_url}?start_date={date_str}&end_date={date_str}&format=jsonl"
             api_diag['attempted_urls'].append(attempt_url)
-            _progress(f"Requesting page_count from API...")
+            _progress(f"Requesting page_count day {i+1}/{days}: {date_str}...")
             try:
-                resp = requests.get(attempt_url, headers=headers, timeout=60)
+                resp = requests.get(attempt_url, headers=headers, timeout=30)
                 api_diag['status_code'] = resp.status_code
                 resp.raise_for_status()
                 txt = resp.text.strip()
-                if txt.startswith('['):
-                    data = resp.json()
-                    if isinstance(data, list):
-                        rows.extend(data)
-                else:
-                    for line in txt.splitlines():
-                        line=line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rows.append(json.loads(line))
-                        except Exception:
-                            continue
+                # JSONL format: one JSON object per line
+                for line in txt.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
             except Exception as e:
-                # Record last error but continue to next attempt
+                # Record error but continue to next day
                 api_diag['error'] = repr(e)
+                _progress(f"  Warning: Failed to fetch {date_str}: {e}", quiet=False)
 
     api_diag['rows_before_flatten'] = len(rows)
     # Flatten wrapper objects like {"visits": [...]} if present
@@ -588,4 +591,320 @@ def fetch_page_count_all(overwrite: bool = False, base_url: str | None = None, a
         'zero_rows_reason': zero_rows_reason,
     }
 
-__all__ = ['fetch_page_count_recent', 'fetch_search_logs_snapshot', 'fetch_page_count_all', 'fetch_search_logs_file']
+def fetch_page_count_postgres(overwrite: bool = False, days: int | None = None, conn_string: str | None = None):
+    """Fetch page_count visits from Postgres database and write per-day raw CSV partitions.
+
+    Args:
+        overwrite: Whether to overwrite existing CSV files
+        days: Number of recent days to fetch (None = all data)
+        conn_string: Postgres connection string (defaults to PAGE_COUNT_DATABASE_URL env var)
+
+    Returns:
+        Dictionary with fetch results and diagnostics
+    """
+    if not PSYCOPG2_AVAILABLE:
+        return {'source': 'page_count', 'error': 'psycopg2 not installed. Run: pip install psycopg2-binary'}
+
+    _progress("Fetching page_count from Postgres...")
+
+    # Get connection string from env if not provided
+    # Try PAGE_COUNT_DATABASE_URL first, then construct from individual vars
+    conn_string = conn_string or os.getenv('PAGE_COUNT_DATABASE_URL')
+    if not conn_string:
+        # Construct from individual environment variables
+        db_host = os.getenv('DB_HOST', '192.168.2.3')
+        db_port = os.getenv('DB_PORT', '5433')
+        db_user = os.getenv('DB_USER', 'Hd4AZn:NlSpH')
+        db_password = os.getenv('DB_PASSWORD', '8&0+6849Mx#S')
+        # Use page_count database
+        conn_string = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/page_count"
+
+    # Parse and decode URL-encoded connection string
+    host = port = dbname = user = password = None
+    if conn_string.startswith('postgresql://'):
+        protocol, rest = conn_string.split('://', 1)
+        creds, location = rest.split('@', 1)
+        user, password = creds.split(':', 1)
+        user = unquote(user)
+        password = unquote(password)
+
+        if '/' in location:
+            host_port, dbname = location.split('/', 1)
+        else:
+            host_port = location
+
+        if ':' in host_port:
+            host, port = host_port.split(':', 1)
+        else:
+            host = host_port
+            port = '5432'
+
+    out_base = RAW_DIR / 'page_count'
+    out_base.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    pg_diag = {
+        'attempted': False,
+        'rows_fetched': 0,
+        'error': None,
+        'query': None,
+    }
+
+    try:
+        _progress("Connecting to page_count Postgres database...")
+        conn = psycopg2.connect(
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
+            password=password
+        )
+        cur = conn.cursor()
+        pg_diag['attempted'] = True
+
+        # Build query with optional date filter
+        if days:
+            date_filter = f"WHERE timestamp >= CURRENT_DATE - INTERVAL '{days} days'"
+            _progress(f"Fetching page_count from last {days} days...")
+        else:
+            date_filter = ""
+            _progress("Fetching all page_count data from database...")
+
+        query = f"""
+            SELECT
+                timestamp,
+                ip_address as ip,
+                user_agent,
+                url
+            FROM visits
+            {date_filter}
+            ORDER BY timestamp
+        """
+        pg_diag['query'] = query
+
+        _progress("Executing page_count query...")
+        cur.execute(query)
+
+        _progress("Fetching page_count results...")
+        batch_size = 10000
+        while True:
+            batch = cur.fetchmany(batch_size)
+            if not batch:
+                break
+            for row in batch:
+                rows.append({
+                    'timestamp': row[0].isoformat() if hasattr(row[0], 'isoformat') else str(row[0]),
+                    'ip': row[1],
+                    'user_agent': row[2],
+                    'url': row[3],
+                })
+            pg_diag['rows_fetched'] = len(rows)
+            if len(rows) % 50000 == 0:
+                _progress(f"Fetched {len(rows):,} page_count records...")
+
+        cur.close()
+        conn.close()
+        _progress(f"Fetched {len(rows):,} total page_count records from Postgres")
+
+    except Exception as e:
+        pg_diag['error'] = repr(e)
+        _progress(f"Error fetching from Postgres: {e}")
+
+    # Calculate date range statistics
+    observed_dates_set = set()
+    earliest_ts = None
+    latest_ts = None
+    for r in rows:
+        ts = r.get('timestamp')
+        if ts:
+            dt_obj = _iso_date(str(ts))
+            if dt_obj:
+                observed_dates_set.add(dt_obj)
+            iso = str(ts)
+            if earliest_ts is None or iso < earliest_ts:
+                earliest_ts = iso
+            if latest_ts is None or iso > latest_ts:
+                latest_ts = iso
+
+    observed_dates = sorted(str(d) for d in observed_dates_set)
+    max_dt = max(observed_dates_set) if observed_dates_set else None
+    freshness_gap_days = (datetime.date.today() - max_dt).days if max_dt else None
+
+    written = _write_rows_per_day(rows, out_base, 'page_count.csv', overwrite)
+    return {
+        'source': 'page_count',
+        'mode': 'postgres',
+        'days': len(written) if written else 0,
+        'written': written,
+        'postgres': pg_diag,
+        'observed_dates': observed_dates,
+        'earliest_ts': earliest_ts,
+        'latest_ts': latest_ts,
+        'freshness_gap_days': freshness_gap_days,
+    }
+
+
+def fetch_search_logs_postgres(overwrite: bool = False, days: int | None = None, conn_string: str | None = None):
+    """Fetch search logs from Postgres database and write per-day raw CSV partitions.
+
+    Args:
+        overwrite: Whether to overwrite existing CSV files
+        days: Number of recent days to fetch (None = all data)
+        conn_string: Postgres connection string (defaults to DATABASE_URL env var)
+
+    Returns:
+        Dictionary with fetch results and diagnostics
+    """
+    if not PSYCOPG2_AVAILABLE:
+        return {'source': 'search_logs', 'error': 'psycopg2 not installed. Run: pip install psycopg2-binary'}
+
+    _progress("Fetching search logs from Postgres...")
+
+    # Get connection string from env if not provided
+    conn_string = conn_string or os.getenv('DATABASE_URL')
+    if not conn_string:
+        return {'source': 'search_logs', 'error': 'No DATABASE_URL found in environment'}
+
+    # Parse and decode URL-encoded connection string
+    # Format: postgresql://user:password@host:port/database
+    host = port = dbname = user = password = None
+    if conn_string.startswith('postgresql://'):
+        # Extract components and decode them
+        protocol, rest = conn_string.split('://', 1)
+        creds, location = rest.split('@', 1)
+        user, password = creds.split(':', 1)
+        user = unquote(user)
+        password = unquote(password)
+
+        # Parse location (host:port/database)
+        if '/' in location:
+            host_port, dbname = location.split('/', 1)
+        else:
+            host_port = location
+
+        if ':' in host_port:
+            host, port = host_port.split(':', 1)
+        else:
+            host = host_port
+            port = '5432'
+
+    out_base = RAW_DIR / 'search_logs'
+    out_base.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    pg_diag = {
+        'attempted': False,
+        'rows_fetched': 0,
+        'error': None,
+        'query': None,
+    }
+
+    try:
+        _progress("Connecting to Postgres database...")
+        # Use individual connection parameters instead of connection string
+        conn = psycopg2.connect(
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
+            password=password
+        )
+        cur = conn.cursor()
+        pg_diag['attempted'] = True
+
+        # Build query with optional date filter
+        if days:
+            date_filter = f"WHERE timestamp >= CURRENT_DATE - INTERVAL '{days} days'"
+            _progress(f"Fetching search logs from last {days} days...")
+        else:
+            date_filter = ""
+            _progress("Fetching all search logs from database...")
+
+        query = f"""
+            SELECT
+                timestamp,
+                client_ip as ip,
+                query,
+                results_count,
+                execution_time,
+                page,
+                page_size,
+                user_agent,
+                referer
+            FROM search_logs
+            {date_filter}
+            ORDER BY timestamp
+        """
+        pg_diag['query'] = query
+
+        cur.execute(query)
+
+        # Fetch all rows
+        _progress("Fetching rows from database...")
+        db_rows = cur.fetchall()
+        pg_diag['rows_fetched'] = len(db_rows)
+        _progress(f"Retrieved {len(db_rows)} rows from Postgres")
+
+        # Convert to dict format
+        columns = ['timestamp', 'ip', 'query', 'results_count', 'execution_time', 'page', 'page_size', 'user_agent', 'referer']
+        for row in db_rows:
+            row_dict = {}
+            for i, col in enumerate(columns):
+                value = row[i]
+                # Convert timestamp to ISO string
+                if col == 'timestamp' and value:
+                    row_dict[col] = value.isoformat()
+                elif value is not None:
+                    row_dict[col] = str(value)
+            rows.append(row_dict)
+
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        pg_diag['error'] = repr(e)
+        _progress(f"Postgres error: {e}")
+        return {
+            'source': 'search_logs',
+            'mode': 'postgres',
+            'error': repr(e),
+            'postgres': pg_diag,
+            'rows': 0,
+            'days': 0,
+            'written': {}
+        }
+
+    # Write rows per day
+    written = _write_rows_per_day(rows, out_base, 'search_logs.csv', overwrite)
+
+    # Calculate date range
+    observed_dates_set = set()
+    earliest_ts = None
+    latest_ts = None
+    for r in rows:
+        ts = r.get('timestamp')
+        if ts:
+            dt_obj = _iso_date(str(ts))
+            if dt_obj:
+                observed_dates_set.add(dt_obj)
+            if earliest_ts is None or ts < earliest_ts:
+                earliest_ts = ts
+            if latest_ts is None or ts > latest_ts:
+                latest_ts = ts
+
+    observed_dates = sorted(str(d) for d in observed_dates_set)
+
+    return {
+        'source': 'search_logs',
+        'mode': 'postgres',
+        'rows': len(rows),
+        'days': len(written),
+        'written': written,
+        'postgres': pg_diag,
+        'observed_dates': observed_dates,
+        'earliest_ts': earliest_ts,
+        'latest_ts': latest_ts,
+    }
+
+
+__all__ = ['fetch_page_count_recent', 'fetch_search_logs_snapshot', 'fetch_page_count_all', 'fetch_search_logs_file', 'fetch_search_logs_postgres']

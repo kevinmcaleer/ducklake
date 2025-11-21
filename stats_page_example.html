@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KevsRobots.com Statistics</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .stat-card h3 {
+            margin-top: 0;
+            color: #333;
+            font-size: 16px;
+            font-weight: 600;
+        }
+        .stat-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #2563eb;
+        }
+        .chart-container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .chart-container h2 {
+            margin-top: 0;
+            color: #333;
+            font-size: 20px;
+        }
+        .chart-wrapper {
+            position: relative;
+            height: 400px;
+        }
+        .chart-wrapper-small {
+            position: relative;
+            height: 300px;
+        }
+        .trend-up {
+            color: #10b981;
+        }
+        .trend-down {
+            color: #ef4444;
+        }
+        .trend-new {
+            background: #10b981;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .query-list {
+            list-style: none;
+            padding: 0;
+        }
+        .query-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .query-item:last-child {
+            border-bottom: none;
+        }
+        .last-updated {
+            text-align: center;
+            color: #6b7280;
+            font-size: 14px;
+            margin-top: 40px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>KevsRobots.com Statistics</h1>
+        <p>Public analytics dashboard - Updated hourly</p>
+    </div>
+
+    <!-- Summary Stats -->
+    <div class="stats-grid">
+        <div class="stat-card">
+            <h3>Total Visits (Last Month)</h3>
+            <div class="stat-value" id="totalVisits">-</div>
+        </div>
+        <div class="stat-card">
+            <h3>Total Searches (Last Month)</h3>
+            <div class="stat-value" id="totalSearches">-</div>
+        </div>
+        <div class="stat-card">
+            <h3>Total Users (Last Month)</h3>
+            <div class="stat-value" id="totalUsers">-</div>
+        </div>
+        <div class="stat-card">
+            <h3>Returning Users</h3>
+            <div class="stat-value" id="returningUsers">-</div>
+        </div>
+    </div>
+
+    <!-- Searches Per Day Chart -->
+    <div class="chart-container">
+        <h2>Searches Over Time (Last Year)</h2>
+        <div class="chart-wrapper">
+            <canvas id="searchesPerDayChart"></canvas>
+        </div>
+    </div>
+
+    <!-- Top Searches -->
+    <div class="chart-container">
+        <h2>Top Searches This Week</h2>
+        <ul class="query-list" id="topSearchesWeek"></ul>
+    </div>
+
+    <div class="chart-container">
+        <h2>Trending Searches (Week-over-Week)</h2>
+        <ul class="query-list" id="trendingSearches"></ul>
+    </div>
+
+    <!-- Device Breakdown -->
+    <div class="chart-container">
+        <h2>Device Breakdown</h2>
+        <div class="chart-wrapper-small">
+            <canvas id="deviceChart"></canvas>
+        </div>
+    </div>
+
+    <!-- OS Breakdown -->
+    <div class="chart-container">
+        <h2>Operating System Breakdown</h2>
+        <div class="chart-wrapper-small">
+            <canvas id="osChart"></canvas>
+        </div>
+    </div>
+
+    <!-- Page Type Breakdown -->
+    <div class="chart-container">
+        <h2>Popular Content Types</h2>
+        <div class="chart-wrapper-small">
+            <canvas id="pageTypeChart"></canvas>
+        </div>
+    </div>
+
+    <!-- Popular Pages -->
+    <div class="chart-container">
+        <h2>Most Popular Pages (Last 30 Days)</h2>
+        <ul class="query-list" id="popularPages"></ul>
+    </div>
+
+    <div class="last-updated" id="lastUpdated">
+        Loading data...
+    </div>
+
+    <script>
+        // Configuration
+        const API_URL = 'http://localhost:8000/api/dashboard'; // Change to your production URL
+
+        // Fetch and render dashboard data
+        async function loadDashboard() {
+            try {
+                const response = await fetch(API_URL);
+                const data = await response.json();
+
+                // Update summary stats
+                document.getElementById('totalVisits').textContent = data.totals.visits_last_month.toLocaleString();
+                document.getElementById('totalSearches').textContent = data.totals.searches_last_month.toLocaleString();
+                document.getElementById('totalUsers').textContent = data.user_stats.total_users.toLocaleString();
+                document.getElementById('returningUsers').textContent = data.user_stats.returning_users.toLocaleString();
+
+                // Searches per day chart
+                renderLineChart(
+                    'searchesPerDayChart',
+                    'Searches per Day',
+                    data.searches_per_day.map(d => d.date),
+                    data.searches_per_day.map(d => d.count)
+                );
+
+                // Top searches list
+                renderTopSearches('topSearchesWeek', data.top_searches_week);
+
+                // Trending searches with movement indicators
+                renderTrendingSearches('trendingSearches', data.search_trends);
+
+                // Device breakdown pie chart
+                renderPieChart(
+                    'deviceChart',
+                    'Devices',
+                    Object.keys(data.device_breakdown),
+                    Object.values(data.device_breakdown)
+                );
+
+                // OS breakdown pie chart
+                renderPieChart(
+                    'osChart',
+                    'Operating Systems',
+                    Object.keys(data.os_breakdown),
+                    Object.values(data.os_breakdown)
+                );
+
+                // Page type breakdown pie chart
+                renderPieChart(
+                    'pageTypeChart',
+                    'Content Types',
+                    Object.keys(data.page_type_breakdown),
+                    Object.values(data.page_type_breakdown)
+                );
+
+                // Popular pages list
+                renderPopularPages('popularPages', data.popular_pages);
+
+                // Update timestamp
+                const lastUpdate = new Date(data.last_updated);
+                document.getElementById('lastUpdated').textContent =
+                    `Last updated: ${lastUpdate.toLocaleString()}`;
+
+            } catch (error) {
+                console.error('Error loading dashboard:', error);
+                document.getElementById('lastUpdated').textContent =
+                    'Error loading data. Please try again later.';
+            }
+        }
+
+        // Render line chart
+        function renderLineChart(canvasId, label, labels, data) {
+            new Chart(document.getElementById(canvasId), {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: label,
+                        data: data,
+                        borderColor: '#2563eb',
+                        backgroundColor: 'rgba(37, 99, 235, 0.1)',
+                        tension: 0.4,
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        }
+                    },
+                    scales: {
+                        x: {
+                            display: true,
+                            ticks: {
+                                maxTicksLimit: 12
+                            }
+                        },
+                        y: {
+                            beginAtZero: true
+                        }
+                    }
+                }
+            });
+        }
+
+        // Render pie chart
+        function renderPieChart(canvasId, label, labels, data) {
+            new Chart(document.getElementById(canvasId), {
+                type: 'pie',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: label,
+                        data: data,
+                        backgroundColor: [
+                            '#2563eb',
+                            '#10b981',
+                            '#f59e0b',
+                            '#ef4444',
+                            '#8b5cf6',
+                            '#ec4899'
+                        ]
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'right'
+                        }
+                    }
+                }
+            });
+        }
+
+        // Render top searches list
+        function renderTopSearches(elementId, searches) {
+            const list = document.getElementById(elementId);
+            list.innerHTML = searches.map((item, index) => `
+                <li class="query-item">
+                    <span><strong>#${index + 1}</strong> ${item.query}</span>
+                    <span class="stat-value" style="font-size: 20px;">${item.count}</span>
+                </li>
+            `).join('');
+        }
+
+        // Render trending searches with indicators
+        function renderTrendingSearches(elementId, trends) {
+            const list = document.getElementById(elementId);
+            list.innerHTML = trends.map((item, index) => {
+                let indicator = '';
+                if (item.is_new) {
+                    indicator = '<span class="trend-new">NEW</span>';
+                } else if (item.rank_change > 0) {
+                    indicator = `<span class="trend-up">↑${item.rank_change}</span>`;
+                } else if (item.rank_change < 0) {
+                    indicator = `<span class="trend-down">↓${Math.abs(item.rank_change)}</span>`;
+                }
+
+                return `
+                    <li class="query-item">
+                        <span><strong>#${item.rank}</strong> ${item.query} ${indicator}</span>
+                        <span class="stat-value" style="font-size: 20px;">${item.count}</span>
+                    </li>
+                `;
+            }).join('');
+        }
+
+        // Render popular pages list
+        function renderPopularPages(elementId, pages) {
+            const list = document.getElementById(elementId);
+            list.innerHTML = pages.slice(0, 10).map((page, index) => {
+                const url = new URL(page.url);
+                const displayUrl = url.pathname;
+
+                return `
+                    <li class="query-item">
+                        <span>
+                            <strong>#${index + 1}</strong>
+                            <a href="${page.url}" target="_blank">${displayUrl}</a>
+                            <small style="color: #6b7280;"> (${page.page_type})</small>
+                        </span>
+                        <span class="stat-value" style="font-size: 20px;">${page.visits.toLocaleString()}</span>
+                    </li>
+                `;
+            }).join('');
+        }
+
+        // Load dashboard on page load
+        loadDashboard();
+
+        // Refresh every 5 minutes
+        setInterval(loadDashboard, 5 * 60 * 1000);
+    </script>
+</body>
+</html>

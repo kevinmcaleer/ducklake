@@ -13,3 +13,4 @@ data
 *.ducklake
 *.parguet
 *.parquet
+.env

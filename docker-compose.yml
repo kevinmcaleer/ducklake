@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  ducklake-analytics:
+    build: .
+    container_name: ducklake-analytics
+    ports:
+      - "8002:8000"  # Map container port 8000 to host port 8002
+    environment:
+      # DuckDB configuration
+      - DUCKDB_PATH=/app/contentlake.ducklake
+      - UPDATE_INTERVAL_HOURS=1
+
+      # Postgres connection for page_count
+      - DB_HOST=${DB_HOST:-192.168.2.3}
+      - DB_PORT=${DB_PORT:-5433}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - PAGE_COUNT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/page_count
+
+      # Postgres connection for search_logs
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/searchlogs
+
+      # API configuration
+      - HOST=0.0.0.0
+      - PORT=8000
+    volumes:
+      # Persist DuckDB database and data
+      - ./data:/app/data
+      - ./contentlake.ducklake:/app/contentlake.ducklake
+      - ./dashboard_data.json:/app/dashboard_data.json
+      - ./reports:/app/reports
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - analytics-network
+
+networks:
+  analytics-network:
+    driver: bridge

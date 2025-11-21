@@ -6,3 +6,9 @@ requests
 user-agents
 dash
 plotly
+fastapi
+uvicorn[standard]
+apscheduler
+psycopg2-binary
+python-dotenv
+python-dateutil

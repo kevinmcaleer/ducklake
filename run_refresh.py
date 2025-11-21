@@ -20,7 +20,7 @@ Exit codes:
   1 unexpected failure
 """
 from __future__ import annotations
-import argparse, sys, pathlib, json, duckdb, shutil, datetime
+import argparse, sys, pathlib, json, duckdb, shutil, datetime, os
 from typing import Optional
 from ducklake_core.simple_pipeline import (
     simple_refresh,
@@ -33,9 +33,11 @@ from ducklake_core.simple_pipeline import (
 )
 from ducklake_core.fetch_raw import (
     fetch_page_count_recent,
+    fetch_page_count_postgres,
     fetch_search_logs_snapshot,
     fetch_page_count_all,
     fetch_search_logs_file,
+    fetch_search_logs_postgres,
 )
 from ducklake_core.export_reports import export_reports_command
 
@@ -280,20 +282,38 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     # Default behavior: if --sources omitted, fetch both sources
     sources = args.sources if args.sources is not None else ['page_count', 'search_logs']
     if 'page_count' in sources or 'all' in sources:
-        results['page_count'] = fetch_page_count_recent(
-            args.days,
-            overwrite=args.overwrite,
-            base_url=args.page_count_url,
-            api_key=args.page_count_key,
-            fallback_dir=pathlib.Path(args.fallback_dir) if args.fallback_dir else None,
+        # Use Postgres by default if PAGE_COUNT_DATABASE_URL is set or DB_HOST is available
+        use_postgres = getattr(args, 'page_count_postgres', False) or (
+            (os.getenv('PAGE_COUNT_DATABASE_URL') or os.getenv('DB_HOST')) and not args.page_count_url
         )
+        if use_postgres:
+            results['page_count'] = fetch_page_count_postgres(
+                overwrite=args.overwrite,
+                days=args.days,
+            )
+        else:
+            results['page_count'] = fetch_page_count_recent(
+                args.days,
+                overwrite=args.overwrite,
+                base_url=args.page_count_url,
+                api_key=args.page_count_key,
+                fallback_dir=pathlib.Path(args.fallback_dir) if args.fallback_dir else None,
+            )
     if 'search_logs' in sources or 'all' in sources:
-        results['search_logs'] = fetch_search_logs_snapshot(
-            snapshot_url=args.search_logs_url,
-            overwrite=args.overwrite,
-            base_url=args.search_logs_url,
-            api_key=args.search_logs_key,
-        )
+        # Use Postgres by default if DATABASE_URL is set, otherwise use API
+        use_postgres = getattr(args, 'search_logs_postgres', False) or (os.getenv('DATABASE_URL') and not args.search_logs_url)
+        if use_postgres:
+            results['search_logs'] = fetch_search_logs_postgres(
+                overwrite=args.overwrite,
+                days=args.days,
+            )
+        else:
+            results['search_logs'] = fetch_search_logs_snapshot(
+                snapshot_url=args.search_logs_url,
+                overwrite=args.overwrite,
+                base_url=args.search_logs_url,
+                api_key=args.search_logs_key,
+            )
     if args.refresh:
         print("[progress] Running pipeline refresh...", file=sys.stderr, flush=True)
     ref = simple_refresh(_connect(args.db)) if args.refresh else None
@@ -305,13 +325,27 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 def cmd_backfill(args: argparse.Namespace) -> int:
     """Full historical backfill for page_count (and optionally search logs snapshot) then refresh.
 
-    Page count: attempts API full export (all=1) else consumes every local JSONL archive.
-    Search logs: if --search-logs-url provided we treat it as a full snapshot and ingest per-day.
+    Page count: uses Postgres by default if available, otherwise attempts API full export or local archives.
+    Search logs: uses Postgres by default if available, otherwise uses provided snapshot URL or file.
     """
     print("[progress] Starting backfill...", file=sys.stderr, flush=True)
     results = {}
-    results['page_count'] = fetch_page_count_all(overwrite=args.overwrite, base_url=args.page_count_url, api_key=args.page_count_key, fallback_dir=pathlib.Path(args.fallback_dir) if args.fallback_dir else None)
-    if args.search_logs_url:
+
+    # Use Postgres for page_count if available
+    use_postgres = getattr(args, 'page_count_postgres', False) or (
+        (os.getenv('PAGE_COUNT_DATABASE_URL') or os.getenv('DB_HOST')) and not args.page_count_url
+    )
+    if use_postgres:
+        results['page_count'] = fetch_page_count_postgres(overwrite=args.overwrite, days=None)  # None = all data
+    else:
+        results['page_count'] = fetch_page_count_all(overwrite=args.overwrite, base_url=args.page_count_url, api_key=args.page_count_key, fallback_dir=pathlib.Path(args.fallback_dir) if args.fallback_dir else None)
+
+    # Determine which search logs source to use (priority: postgres > url > file)
+    use_postgres = getattr(args, 'search_logs_postgres', False) or (os.getenv('DATABASE_URL') and not args.search_logs_url and not args.search_logs_file)
+
+    if use_postgres:
+        results['search_logs'] = fetch_search_logs_postgres(overwrite=args.overwrite, days=None)  # None = all data
+    elif args.search_logs_url:
         results['search_logs'] = fetch_search_logs_snapshot(snapshot_url=args.search_logs_url, overwrite=args.overwrite, base_url=args.search_logs_url, api_key=args.search_logs_key)
     elif args.search_logs_file:
         results['search_logs'] = fetch_search_logs_file(args.search_logs_file, overwrite=args.overwrite)
@@ -374,8 +408,10 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("--days", type=int, default=1, help="Recent days to fetch for page_count")
     fp.add_argument("--page-count-url", help="Override PAGE_COUNT_API_URL")
     fp.add_argument("--page-count-key", help="API key for page_count endpoint")
+    fp.add_argument("--page-count-postgres", action="store_true", help="Fetch page_count from Postgres database (uses PAGE_COUNT_DATABASE_URL or DB_HOST from .env)")
     fp.add_argument("--search-logs-url", help="Override SEARCH_LOGS_API_URL / snapshot URL")
     fp.add_argument("--search-logs-key", help="API key for search_logs endpoint")
+    fp.add_argument("--search-logs-postgres", action="store_true", help="Fetch search logs from Postgres database (uses DATABASE_URL from .env)")
     fp.add_argument("--fallback-dir", help="Fallback directory of local JSONL files (all-visits-*.jsonl)")
     fp.add_argument("--overwrite", action="store_true", help="Overwrite existing raw CSV partitions for fetched days")
     fp.add_argument("--refresh", action="store_true", help="Run pipeline refresh after fetch")
@@ -386,8 +422,10 @@ def build_parser() -> argparse.ArgumentParser:
     bp = sub.add_parser("backfill", help="Full historical backfill for page_count (API all=1 or all local archives) and optional search logs snapshot")
     bp.add_argument("--page-count-url", help="API base URL for page_count full export (will append all=1 if not present)")
     bp.add_argument("--page-count-key", help="API key for page_count endpoint")
+    bp.add_argument("--page-count-postgres", action="store_true", help="Fetch page_count from Postgres database (uses PAGE_COUNT_DATABASE_URL or DB_HOST from .env)")
     bp.add_argument("--search-logs-url", help="Full snapshot URL for search logs (JSON or JSONL)")
     bp.add_argument("--search-logs-file", help="Local search logs file path (e.g. /Volumes/Search\\ Logs/Search-Logs.log)")
+    bp.add_argument("--search-logs-postgres", action="store_true", help="Fetch search logs from Postgres database (uses DATABASE_URL from .env)")
     bp.add_argument("--search-logs-key", help="API key for search_logs endpoint")
     bp.add_argument("--fallback-dir", help="Fallback directory of local JSONL files (all-visits-*.jsonl)")
     bp.add_argument("--overwrite", action="store_true", help="Overwrite existing per-day raw CSV partitions")

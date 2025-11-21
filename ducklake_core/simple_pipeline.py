@@ -52,11 +52,16 @@ def _scalar(conn: duckdb.DuckDBPyConnection, sql: str, params=None):
 
 
 def file_id(path: pathlib.Path) -> str:
-  st = path.stat()
+  """Generate a stable file ID based on path and content hash.
+
+  Uses path + content hash instead of mtime to avoid re-processing
+  files that are rewritten with same content (e.g., during overwrite fetch).
+  """
   h = hashlib.sha256()
   h.update(str(path).encode())
-  h.update(str(st.st_size).encode())
-  h.update(str(int(st.st_mtime)).encode())
+  # Hash file content instead of mtime for stability
+  with path.open('rb') as f:
+    h.update(f.read())
   return h.hexdigest()
 
 
