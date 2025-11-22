@@ -1,5 +1,5 @@
 {
-  "last_updated": "2025-11-22T16:00:08.454060+00:00",
+  "last_updated": "2025-11-22T23:00:09.585474+00:00",
   "date_range": {
     "today": "2025-11-22",
     "year_ago": "2024-11-22",
@@ -1490,7 +1490,7 @@
       "count": 4
     },
     {
-      "query": "bluetooth",
+      "query": "pimoroni hat",
       "count": 3
     }
   ],
@@ -1524,15 +1524,15 @@
       "count": 9
     },
     {
-      "query": "raspberry pico",
-      "count": 8
-    },
-    {
       "query": "uno q",
       "count": 8
     },
     {
-      "query": "lidar",
+      "query": "raspberry pico",
+      "count": 8
+    },
+    {
+      "query": "raspberry pi pico 2 w",
       "count": 7
     }
   ],
@@ -1541,7 +1541,7 @@
       "query": "python",
       "count": 11,
       "rank": 1,
-      "rank_change": 7,
+      "rank_change": 6,
       "trend": "up",
       "is_new": false
     },
@@ -1586,7 +1586,7 @@
       "is_new": true
     },
     {
-      "query": "paper",
+      "query": "homelab",
       "count": 2,
       "rank": 7,
       "rank_change": 992,
@@ -1594,7 +1594,7 @@
       "is_new": true
     },
     {
-      "query": "homelab",
+      "query": "paper",
       "count": 2,
       "rank": 8,
       "rank_change": 991,
@@ -1602,7 +1602,7 @@
       "is_new": true
     },
     {
-      "query": "picotamachibi",
+      "query": "automation hat mini",
       "count": 2,
       "rank": 9,
       "rank_change": 990,
@@ -1610,7 +1610,7 @@
       "is_new": true
     },
     {
-      "query": "automation hat mini",
+      "query": "picotamachibi",
       "count": 2,
       "rank": 10,
       "rank_change": 989,
@@ -1625,10 +1625,10 @@
     "bot": 26
   },
   "os_breakdown": {
-    "Other": 45,
-    "Linux": 275,
     "macOS": 369,
     "Windows": 151,
+    "Linux": 275,
+    "Other": 45,
     "Android": 32
   },
   "popular_pages": [

@@ -108,7 +108,18 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
     week_ago = today - timedelta(days=7)
 
     try:
-        # 1. Searches per day over last year
+        # 1. Page visits per day over last year
+        visits_per_day = con.execute("""
+            SELECT
+                dt::VARCHAR as date,
+                COUNT(*) as count
+            FROM lake_page_count
+            WHERE dt >= ?
+            GROUP BY dt
+            ORDER BY dt
+        """, [year_ago]).fetchall()
+
+        # 2. Searches per day over last year
         searches_per_day = con.execute("""
             SELECT
                 dt::VARCHAR as date,
@@ -119,7 +130,7 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
             ORDER BY dt
         """, [year_ago]).fetchall()
 
-        # 2. Top searches this week
+        # 3. Top searches this week
         top_searches_week = con.execute("""
             SELECT query, SUM(cnt) as count
             FROM searches_daily
@@ -286,6 +297,10 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
                 "month_ago": month_ago.isoformat(),
                 "week_ago": week_ago.isoformat()
             },
+            "visits_per_day": [
+                {"date": date_str, "count": count}
+                for date_str, count in visits_per_day
+            ],
             "searches_per_day": [
                 {"date": date_str, "count": count}
                 for date_str, count in searches_per_day
