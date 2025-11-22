@@ -15,3 +15,7 @@ raw
 *.parguet
 *.parquet
 .env
+
+# Generated cache and dashboard files
+dashboard_data.json
+data/ip_country_cache.json
