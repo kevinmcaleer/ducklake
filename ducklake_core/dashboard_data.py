@@ -154,18 +154,25 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
                 FROM searches_daily
                 WHERE dt >= ? AND dt < ?
                 GROUP BY query
+            ),
+            historical AS (
+                SELECT DISTINCT query
+                FROM searches_daily
+                WHERE dt < ?
             )
             SELECT
                 tw.query,
                 tw.count as this_week_count,
                 tw.rank as this_week_rank,
                 COALESCE(lw.rank, 999) as last_week_rank,
-                COALESCE(lw.rank, 999) - tw.rank as rank_change
+                COALESCE(lw.rank, 999) - tw.rank as rank_change,
+                CASE WHEN h.query IS NULL THEN TRUE ELSE FALSE END as is_new
             FROM this_week tw
             LEFT JOIN last_week lw ON tw.query = lw.query
+            LEFT JOIN historical h ON tw.query = h.query
             WHERE tw.rank <= 10
             ORDER BY tw.rank
-        """, [week_ago, week_ago - timedelta(days=7), week_ago]).fetchall()
+        """, [week_ago, week_ago - timedelta(days=7), week_ago, week_ago]).fetchall()
 
         # 5. Device and OS breakdown (from page_count user_agent)
         # Parse user agents on-the-fly
@@ -298,9 +305,9 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
                     "rank": this_week_rank,
                     "rank_change": rank_change,
                     "trend": "up" if rank_change > 0 else ("down" if rank_change < 0 else "stable"),
-                    "is_new": last_week_rank >= 999
+                    "is_new": is_new
                 }
-                for query, this_week_count, this_week_rank, last_week_rank, rank_change in trends
+                for query, this_week_count, this_week_rank, last_week_rank, rank_change, is_new in trends
             ],
             "device_breakdown": device_counts,
             "os_breakdown": os_counts,

@@ -1,16 +1,12 @@
 {
-  "last_updated": "2025-11-21T17:00:09.273738+00:00",
+  "last_updated": "2025-11-22T16:00:08.454060+00:00",
   "date_range": {
-    "today": "2025-11-21",
-    "year_ago": "2024-11-21",
-    "month_ago": "2025-10-22",
-    "week_ago": "2025-11-14"
+    "today": "2025-11-22",
+    "year_ago": "2024-11-22",
+    "month_ago": "2025-10-23",
+    "week_ago": "2025-11-15"
   },
   "searches_per_day": [
-    {
-      "date": "2024-11-21",
-      "count": 11
-    },
     {
       "date": "2024-11-22",
       "count": 28
@@ -1470,6 +1466,10 @@
     {
       "date": "2025-11-21",
       "count": 11
+    },
+    {
+      "date": "2025-11-22",
+      "count": 3
     }
   ],
   "top_searches_week": [
@@ -1490,7 +1490,7 @@
       "count": 4
     },
     {
-      "query": "pimoroni hat",
+      "query": "bluetooth",
       "count": 3
     }
   ],
@@ -1512,11 +1512,11 @@
       "count": 14
     },
     {
-      "query": "ai",
+      "query": "bluetooth",
       "count": 10
     },
     {
-      "query": "bluetooth",
+      "query": "ai",
       "count": 10
     },
     {
@@ -1524,16 +1524,16 @@
       "count": 9
     },
     {
-      "query": "uno q",
-      "count": 8
-    },
-    {
       "query": "raspberry pico",
       "count": 8
     },
     {
-      "query": "lidar",
+      "query": "uno q",
       "count": 8
+    },
+    {
+      "query": "lidar",
+      "count": 7
     }
   ],
   "search_trends": [
@@ -1541,7 +1541,7 @@
       "query": "python",
       "count": 11,
       "rank": 1,
-      "rank_change": 3,
+      "rank_change": 7,
       "trend": "up",
       "is_new": false
     },
@@ -1570,31 +1570,31 @@
       "is_new": true
     },
     {
-      "query": "pimoroni hat",
+      "query": "bluetooth",
       "count": 3,
       "rank": 5,
-      "rank_change": 994,
+      "rank_change": 8,
+      "trend": "up",
+      "is_new": false
+    },
+    {
+      "query": "pimoroni hat",
+      "count": 3,
+      "rank": 6,
+      "rank_change": 993,
       "trend": "up",
       "is_new": true
     },
     {
-      "query": "bluetooth",
-      "count": 3,
-      "rank": 6,
-      "rank_change": 4,
-      "trend": "up",
-      "is_new": false
-    },
-    {
-      "query": "ros",
+      "query": "paper",
       "count": 2,
       "rank": 7,
-      "rank_change": -6,
-      "trend": "down",
-      "is_new": false
+      "rank_change": 992,
+      "trend": "up",
+      "is_new": true
     },
     {
-      "query": "paper",
+      "query": "homelab",
       "count": 2,
       "rank": 8,
       "rank_change": 991,
@@ -1602,7 +1602,7 @@
       "is_new": true
     },
     {
-      "query": "automation hat mini",
+      "query": "picotamachibi",
       "count": 2,
       "rank": 9,
       "rank_change": 990,
@@ -1610,7 +1610,7 @@
       "is_new": true
     },
     {
-      "query": "picotamachibi",
+      "query": "automation hat mini",
       "count": 2,
       "rank": 10,
       "rank_change": 989,
@@ -1619,134 +1619,134 @@
     }
   ],
   "device_breakdown": {
-    "desktop": 402,
-    "mobile": 461,
+    "desktop": 394,
+    "mobile": 452,
     "tablet": 0,
     "bot": 26
   },
   "os_breakdown": {
-    "macOS": 378,
-    "Linux": 279,
-    "Windows": 154,
     "Other": 45,
-    "Android": 33
+    "Linux": 275,
+    "macOS": 369,
+    "Windows": 151,
+    "Android": 32
   },
   "popular_pages": [
     {
       "url": "https://www.kevsrobots.com/",
-      "visits": 3418,
+      "visits": 4001,
       "page_type": "home"
     },
     {
       "url": "https://www.kevsrobots.com/blog/pico-projects.html",
-      "visits": 1219,
+      "visits": 1329,
       "page_type": "blog"
     },
     {
       "url": "https://www.kevsrobots.com/projects/mini-rack/",
-      "visits": 752,
+      "visits": 824,
       "page_type": "project"
     },
     {
       "url": "https://www.kevsrobots.com/learn/docker_swarm/02_cloning-raspberry-pi-os.html",
-      "visits": 628,
+      "visits": 697,
       "page_type": "course"
     },
     {
+      "url": "https://www.kevsrobots.com/blog/ollama",
+      "visits": 622,
+      "page_type": "blog"
+    },
+    {
       "url": "https://www.kevsrobots.com/blog/build-a-home-server.html",
-      "visits": 596,
+      "visits": 621,
       "page_type": "blog"
     },
     {
       "url": "https://www.kevsrobots.com/blog/3d_papercraft.html",
-      "visits": 567,
+      "visits": 612,
       "page_type": "blog"
     },
     {
       "url": "https://www.kevsrobots.com/blog/dynamic-dns.html",
-      "visits": 555,
-      "page_type": "blog"
-    },
-    {
-      "url": "https://www.kevsrobots.com/blog/ollama",
-      "visits": 550,
+      "visits": 606,
       "page_type": "blog"
     },
     {
       "url": "https://www.kevsrobots.com/blog/timemachine.html",
-      "visits": 454,
+      "visits": 562,
       "page_type": "blog"
     },
     {
       "url": "https://www.kevsrobots.com/projects/smars-q/",
-      "visits": 446,
+      "visits": 486,
       "page_type": "project"
     },
     {
       "url": "https://www.kevsrobots.com/blog/timemachine",
-      "visits": 438,
+      "visits": 436,
       "page_type": "blog"
+    },
+    {
+      "url": "http://0.0.0.0:4000/",
+      "visits": 402,
+      "page_type": "home"
     },
     {
       "url": "https://www.kevsrobots.com/blog/uno-q-tips.html",
-      "visits": 398,
-      "page_type": "blog"
-    },
-    {
-      "url": "https://www.kevsrobots.com/blog/smars-q.html",
-      "visits": 372,
-      "page_type": "blog"
-    },
-    {
-      "url": "https://www.kevsrobots.com/blog/setting-up-samba-for-retropie.html",
-      "visits": 336,
+      "visits": 400,
       "page_type": "blog"
     },
     {
       "url": "http://www.kevsrobots.com/",
-      "visits": 334,
+      "visits": 387,
       "page_type": "home"
     },
     {
-      "url": "https://www.kevsrobots.com/learn/micropython/12_if_elif_else.html",
-      "visits": 312,
-      "page_type": "course"
+      "url": "https://www.kevsrobots.com/blog/smars-q.html",
+      "visits": 368,
+      "page_type": "blog"
+    },
+    {
+      "url": "https://www.kevsrobots.com/blog/setting-up-samba-for-retropie.html",
+      "visits": 351,
+      "page_type": "blog"
     },
     {
       "url": "https://www.kevsrobots.com/robots/",
-      "visits": 312,
+      "visits": 346,
       "page_type": "other"
     },
     {
-      "url": "https://www.kevsrobots.com/blog/woodbot.html",
-      "visits": 267,
-      "page_type": "blog"
+      "url": "https://www.kevsrobots.com/learn/micropython/12_if_elif_else.html",
+      "visits": 326,
+      "page_type": "course"
     },
     {
-      "url": "https://www.kevsrobots.com/blog/pikon-camera.html",
-      "visits": 263,
-      "page_type": "blog"
+      "url": "https://www.kevsrobots.com/resources/how_it_works/potato-battery.html",
+      "visits": 312,
+      "page_type": "project"
     },
     {
       "url": "https://www.kevsrobots.com/learn/pca9685/05_setting_up_the_pca9685_with_raspberry_pi.html",
-      "visits": 263,
+      "visits": 308,
       "page_type": "course"
     }
   ],
   "page_type_breakdown": {
-    "home": 3752,
-    "blog": 6015,
-    "project": 1198,
-    "course": 1203,
-    "other": 312
+    "home": 4790,
+    "blog": 5907,
+    "project": 1622,
+    "course": 1331,
+    "other": 346
   },
   "user_stats": {
-    "new_users": 16792,
-    "returning_users": 1212,
-    "total_users": 18004
+    "new_users": 16360,
+    "returning_users": 1234,
+    "total_users": 17594
   },
   "totals": {
-    "visits_last_month": 60334,
-    "searches_last_month": 480
+    "visits_last_month": 67465,
+    "searches_last_month": 479
   }
 }
