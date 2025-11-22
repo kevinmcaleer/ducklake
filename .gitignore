@@ -9,7 +9,8 @@ bronze
 reports
 _tmp_downloads
 *.duckdb
-data
+lake
+raw
 *.ducklake
 *.parguet
 *.parquet
