@@ -214,7 +214,7 @@ def update_daily_aggregates(conn: duckdb.DuckDBPyConnection):
       INSERT OR REPLACE INTO searches_daily
       SELECT date({time_col}) AS dt,
         lower(trim(regexp_replace(query, '\\s+', ' '))) AS query,
-        count(*) AS cnt
+        count(DISTINCT ip) AS cnt
       FROM lake_search_logs
       WHERE {time_col} IS NOT NULL
         AND query IS NOT NULL
@@ -229,7 +229,7 @@ def update_daily_aggregates(conn: duckdb.DuckDBPyConnection):
     if 'dt' in cols:
       conn.execute("""
         INSERT OR REPLACE INTO searches_daily
-        SELECT dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS query, count(*) AS cnt
+        SELECT dt, lower(trim(regexp_replace(query, '\\s+', ' '))) AS query, count(DISTINCT ip) AS cnt
         FROM lake_search_logs
         WHERE dt > ?
           AND query IS NOT NULL
