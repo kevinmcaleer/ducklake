@@ -28,7 +28,7 @@ RUN mkdir -p /app/data/raw /app/data/lake /app/reports
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV DUCKDB_PATH=/app/contentlake.ducklake
+ENV DUCKDB_PATH=/app/data/contentlake.ducklake
 ENV UPDATE_INTERVAL_HOURS=1
 ENV PORT=8000
 ENV HOST=0.0.0.0
