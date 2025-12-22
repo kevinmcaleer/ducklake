@@ -288,6 +288,183 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
             reverse=True
         )[:20]  # Top 20 countries
 
+        # =====================================================================
+        # VIRAL DETECTION REPORTS
+        # =====================================================================
+
+        # 11. Traffic Anomaly Detector - pages with unusual spikes
+        yesterday = today - timedelta(days=1)
+        two_days_ago = today - timedelta(days=2)
+        traffic_anomalies = con.execute("""
+            WITH recent_traffic AS (
+                SELECT url, COUNT(*) as recent_visits, COUNT(DISTINCT ip) as recent_unique
+                FROM lake_page_count
+                WHERE dt >= ? AND ip NOT LIKE '66.249.%'
+                GROUP BY url
+            ),
+            baseline_traffic AS (
+                SELECT url, COUNT(*) / 7.0 as avg_daily_visits
+                FROM lake_page_count
+                WHERE dt >= ? AND dt < ? AND ip NOT LIKE '66.249.%'
+                GROUP BY url
+            )
+            SELECT
+                r.url,
+                r.recent_visits,
+                r.recent_unique,
+                COALESCE(b.avg_daily_visits, 0) as baseline,
+                CASE
+                    WHEN COALESCE(b.avg_daily_visits, 0) > 0
+                    THEN ROUND((r.recent_visits - b.avg_daily_visits * 2) / b.avg_daily_visits * 100, 0)
+                    ELSE 9999
+                END as pct_increase
+            FROM recent_traffic r
+            LEFT JOIN baseline_traffic b ON r.url = b.url
+            WHERE r.recent_visits > 20
+              AND (b.avg_daily_visits IS NULL OR r.recent_visits > b.avg_daily_visits * 4)
+            ORDER BY r.recent_visits DESC
+            LIMIT 10
+        """, [two_days_ago, week_ago - timedelta(days=7), two_days_ago]).fetchall()
+
+        # 12. Trending Pages (Week-over-Week)
+        trending_pages = con.execute("""
+            WITH this_week AS (
+                SELECT url, COUNT(*) as visits, COUNT(DISTINCT ip) as unique_visitors,
+                       ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) as rank
+                FROM lake_page_count
+                WHERE dt >= ? AND ip NOT LIKE '66.249.%'
+                GROUP BY url
+            ),
+            last_week AS (
+                SELECT url, COUNT(*) as visits,
+                       ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) as rank
+                FROM lake_page_count
+                WHERE dt >= ? AND dt < ? AND ip NOT LIKE '66.249.%'
+                GROUP BY url
+            ),
+            historical AS (
+                SELECT DISTINCT url
+                FROM lake_page_count
+                WHERE dt < ?
+            )
+            SELECT
+                tw.url,
+                tw.visits as this_week_visits,
+                tw.unique_visitors,
+                tw.rank as this_week_rank,
+                COALESCE(lw.visits, 0) as last_week_visits,
+                COALESCE(lw.rank, 999) as last_week_rank,
+                COALESCE(lw.rank, 999) - tw.rank as rank_change,
+                CASE WHEN h.url IS NULL THEN TRUE ELSE FALSE END as is_new
+            FROM this_week tw
+            LEFT JOIN last_week lw ON tw.url = lw.url
+            LEFT JOIN historical h ON tw.url = h.url
+            WHERE tw.rank <= 15
+            ORDER BY tw.rank
+        """, [week_ago, week_ago - timedelta(days=7), week_ago, week_ago]).fetchall()
+
+        # 13. Geographic Traffic Shifts - countries with unusual spikes
+        geographic_shifts = []
+        try:
+            with IPGeolocator() as geolocator:
+                # Get country visits for last 2 days vs baseline
+                recent_ip_visits = con.execute("""
+                    SELECT ip, COUNT(*) as visits
+                    FROM lake_page_count
+                    WHERE dt >= ? AND ip NOT LIKE '66.249.%'
+                    GROUP BY ip
+                """, [two_days_ago]).fetchall()
+
+                baseline_ip_visits = con.execute("""
+                    SELECT ip, COUNT(*) / 7.0 as avg_visits
+                    FROM lake_page_count
+                    WHERE dt >= ? AND dt < ? AND ip NOT LIKE '66.249.%'
+                    GROUP BY ip
+                """, [week_ago - timedelta(days=7), two_days_ago]).fetchall()
+
+                recent_countries = {}
+                for ip, visits in recent_ip_visits:
+                    country_code = geolocator.lookup(ip)
+                    if country_code:
+                        country_name = get_country_name(country_code)
+                        recent_countries[country_name] = recent_countries.get(country_name, 0) + visits
+
+                baseline_countries = {}
+                for ip, avg_visits in baseline_ip_visits:
+                    country_code = geolocator.lookup(ip)
+                    if country_code:
+                        country_name = get_country_name(country_code)
+                        baseline_countries[country_name] = baseline_countries.get(country_name, 0) + avg_visits
+
+                for country, recent in recent_countries.items():
+                    baseline = baseline_countries.get(country, 0) * 2
+                    if recent > 50 and (baseline == 0 or recent > baseline * 2):
+                        pct_increase = int((recent - baseline) / baseline * 100) if baseline > 0 else 9999
+                        geographic_shifts.append({
+                            "country": country,
+                            "recent_visits": recent,
+                            "baseline_daily": round(baseline / 2, 1),
+                            "pct_increase": pct_increase
+                        })
+
+                geographic_shifts = sorted(geographic_shifts, key=lambda x: x['recent_visits'], reverse=True)[:10]
+
+        except Exception as e:
+            print(f"Warning: Could not generate geographic shifts: {e}")
+
+        # 14. New Visitor Surge - daily new vs returning ratio
+        new_visitor_surge = con.execute("""
+            WITH daily_visitors AS (
+                SELECT dt, ip
+                FROM lake_page_count
+                WHERE dt >= ? AND ip NOT LIKE '66.249.%'
+            ),
+            first_seen AS (
+                SELECT ip, MIN(dt) as first_visit_dt
+                FROM lake_page_count
+                WHERE ip NOT LIKE '66.249.%'
+                GROUP BY ip
+            )
+            SELECT
+                dv.dt::VARCHAR as date,
+                COUNT(DISTINCT dv.ip) as total_visitors,
+                COUNT(DISTINCT CASE WHEN fs.first_visit_dt = dv.dt THEN dv.ip END) as new_visitors,
+                COUNT(DISTINCT CASE WHEN fs.first_visit_dt < dv.dt THEN dv.ip END) as returning_visitors
+            FROM daily_visitors dv
+            JOIN first_seen fs ON dv.ip = fs.ip
+            GROUP BY dv.dt
+            ORDER BY dv.dt
+        """, [week_ago - timedelta(days=7)]).fetchall()
+
+        # 15. Hourly Traffic Heatmap - last 7 days
+        hourly_heatmap = con.execute("""
+            SELECT
+                dt::VARCHAR as date,
+                EXTRACT(HOUR FROM timestamp) as hour,
+                COUNT(*) as visits
+            FROM lake_page_count
+            WHERE dt >= ? AND ip NOT LIKE '66.249.%'
+            GROUP BY dt, EXTRACT(HOUR FROM timestamp)
+            ORDER BY dt, hour
+        """, [week_ago]).fetchall()
+
+        # 16. Bot vs Human Traffic Ratio
+        bot_human_traffic = con.execute("""
+            SELECT
+                dt::VARCHAR as date,
+                COUNT(*) as total_visits,
+                COUNT(CASE WHEN ip LIKE '66.249.%' THEN 1 END) as google_bot,
+                COUNT(CASE WHEN user_agent LIKE '%bot%' OR user_agent LIKE '%Bot%'
+                           OR user_agent LIKE '%crawler%' OR user_agent LIKE '%spider%' THEN 1 END) as other_bots,
+                COUNT(CASE WHEN ip NOT LIKE '66.249.%'
+                           AND user_agent NOT LIKE '%bot%' AND user_agent NOT LIKE '%Bot%'
+                           AND user_agent NOT LIKE '%crawler%' AND user_agent NOT LIKE '%spider%' THEN 1 END) as human
+            FROM lake_page_count
+            WHERE dt >= ?
+            GROUP BY dt
+            ORDER BY dt
+        """, [week_ago - timedelta(days=7)]).fetchall()
+
         # Format results
         return {
             "last_updated": datetime.now().astimezone().isoformat(),
@@ -344,7 +521,61 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
             "totals": {
                 "visits_last_month": total_visits,
                 "searches_last_month": total_searches
-            }
+            },
+            # Viral detection reports
+            "traffic_anomalies": [
+                {
+                    "url": url,
+                    "recent_visits": recent_visits,
+                    "unique_visitors": recent_unique,
+                    "baseline_daily": round(baseline, 1),
+                    "pct_increase": int(pct_increase) if pct_increase != 9999 else None,
+                    "is_new": pct_increase == 9999
+                }
+                for url, recent_visits, recent_unique, baseline, pct_increase in traffic_anomalies
+            ],
+            "trending_pages": [
+                {
+                    "url": url,
+                    "visits": this_week_visits,
+                    "unique_visitors": unique_visitors,
+                    "rank": this_week_rank,
+                    "last_week_visits": last_week_visits,
+                    "rank_change": rank_change,
+                    "is_new": is_new
+                }
+                for url, this_week_visits, unique_visitors, this_week_rank, last_week_visits, last_week_rank, rank_change, is_new in trending_pages
+            ],
+            "geographic_shifts": geographic_shifts,
+            "new_visitor_surge": [
+                {
+                    "date": date_str,
+                    "total_visitors": total_visitors,
+                    "new_visitors": new_visitors,
+                    "returning_visitors": returning_visitors,
+                    "new_pct": round(new_visitors / total_visitors * 100, 1) if total_visitors > 0 else 0
+                }
+                for date_str, total_visitors, new_visitors, returning_visitors in new_visitor_surge
+            ],
+            "hourly_heatmap": [
+                {
+                    "date": date_str,
+                    "hour": int(hour),
+                    "visits": visits
+                }
+                for date_str, hour, visits in hourly_heatmap
+            ],
+            "bot_human_traffic": [
+                {
+                    "date": date_str,
+                    "total": total,
+                    "google_bot": google_bot,
+                    "other_bots": other_bots,
+                    "human": human,
+                    "human_pct": round(human / total * 100, 1) if total > 0 else 0
+                }
+                for date_str, total, google_bot, other_bots, human in bot_human_traffic
+            ]
         }
 
     finally:
