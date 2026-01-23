@@ -10,6 +10,38 @@ import re
 from .ip_geolocation import IPGeolocator, get_country_name
 
 
+# Known fake/bot user agent to filter
+FAKE_CHROME_139_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+
+# Developer IP to exclude from human traffic stats
+DEVELOPER_IP = "81.130.193.208"
+
+
+def bot_filter_sql(table_alias: str = "") -> str:
+    """Generate SQL condition to filter out known bots for human traffic calculations.
+
+    Excludes: Google bot IPs, common bot user agents, fake Chrome 139 scraper,
+    local/private IPs, and developer IP.
+
+    Args:
+        table_alias: Optional table alias prefix (e.g., "r" becomes "r.ip")
+    """
+    prefix = f"{table_alias}." if table_alias else ""
+    return f"""
+    {prefix}ip NOT LIKE '66.249.%'
+    AND {prefix}ip NOT LIKE '192.168.%'
+    AND {prefix}ip NOT LIKE '10.%'
+    AND {prefix}ip NOT LIKE '172.16.%'
+    AND {prefix}ip NOT LIKE '127.%'
+    AND {prefix}ip != '{DEVELOPER_IP}'
+    AND {prefix}user_agent NOT LIKE '%bot%' AND {prefix}user_agent NOT LIKE '%Bot%'
+    AND {prefix}user_agent NOT LIKE '%crawler%' AND {prefix}user_agent NOT LIKE '%Crawler%'
+    AND {prefix}user_agent NOT LIKE '%spider%' AND {prefix}user_agent NOT LIKE '%Spider%'
+    AND {prefix}user_agent NOT LIKE '%Sogou%'
+    AND {prefix}user_agent != '{FAKE_CHROME_139_UA}'
+    """
+
+
 def extract_page_type(url: str) -> str:
     """Extract page type from URL path.
 
@@ -221,9 +253,10 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
         # 8. User statistics (based on unique IPs - anonymized)
         # New users = IPs seen only in last 30 days, not before
         # Returning users = IPs seen in last 30 days AND before
-        user_stats = con.execute("""
+        # Also calculates human-only stats (excluding bots)
+        user_stats = con.execute(f"""
             WITH recent_ips AS (
-                SELECT DISTINCT ip
+                SELECT DISTINCT ip, user_agent
                 FROM lake_page_count
                 WHERE dt >= ?
             ),
@@ -234,7 +267,9 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
             )
             SELECT
                 COUNT(DISTINCT r.ip) as total_recent,
-                COUNT(DISTINCT o.ip) as returning_count
+                COUNT(DISTINCT o.ip) as returning_count,
+                COUNT(DISTINCT CASE WHEN {bot_filter_sql("r")} THEN r.ip END) as human_total,
+                COUNT(DISTINCT CASE WHEN {bot_filter_sql("r")} AND o.ip IS NOT NULL THEN r.ip END) as human_returning
             FROM recent_ips r
             LEFT JOIN older_ips o ON r.ip = o.ip
         """, [month_ago, month_ago, month_ago - timedelta(days=60)]).fetchone()
@@ -242,11 +277,21 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
         total_users = user_stats[0] if user_stats else 0
         returning_users = user_stats[1] if user_stats else 0
         new_users = total_users - returning_users
+        human_total_users = user_stats[2] if user_stats else 0
+        human_returning_users = user_stats[3] if user_stats else 0
+        human_new_users = human_total_users - human_returning_users
 
-        # 9. Total visits and searches
-        total_visits = con.execute("""
-            SELECT COUNT(*) FROM lake_page_count WHERE dt >= ?
-        """, [month_ago]).fetchone()[0]
+        # 9. Total visits and searches (with human/bot breakdown)
+        visit_stats = con.execute(f"""
+            SELECT
+                COUNT(*) as total_visits,
+                COUNT(CASE WHEN {bot_filter_sql()} THEN 1 END) as human_visits
+            FROM lake_page_count
+            WHERE dt >= ?
+        """, [month_ago]).fetchone()
+        total_visits = visit_stats[0] if visit_stats else 0
+        human_visits = visit_stats[1] if visit_stats else 0
+        bot_visits = total_visits - human_visits
 
         total_searches = con.execute("""
             SELECT SUM(cnt) FROM searches_daily WHERE dt >= ?
@@ -516,10 +561,15 @@ def generate_dashboard_data(db_path: str = 'contentlake.ducklake') -> dict[str, 
             "user_stats": {
                 "new_users": new_users,
                 "returning_users": returning_users,
-                "total_users": total_users
+                "total_users": total_users,
+                "human_new_users": human_new_users,
+                "human_returning_users": human_returning_users,
+                "human_total_users": human_total_users
             },
             "totals": {
                 "visits_last_month": total_visits,
+                "human_visits_last_month": human_visits,
+                "bot_visits_last_month": bot_visits,
                 "searches_last_month": total_searches
             },
             # Viral detection reports
