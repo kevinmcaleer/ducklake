@@ -1,5 +1,5 @@
 import os, json, pathlib, datetime, requests, csv, re, sys
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 from .simple_pipeline import RAW_DIR
 
 try:
@@ -591,6 +591,23 @@ def fetch_page_count_all(overwrite: bool = False, base_url: str | None = None, a
         'zero_rows_reason': zero_rows_reason,
     }
 
+SITE_ORIGIN = 'https://www.kevsrobots.com/'
+
+# (table, timestamp column) pairs, newest schema first.
+PAGE_COUNT_TABLES = (('page_views', 'viewed_at'), ('visits', 'timestamp'))
+
+
+def absolute_page_url(url):
+    """Turn the counter's relative paths ('blog/x.html', 'index.html') back
+    into the full URLs the lakehouse holds for visits before 2026-05-13."""
+    if not url or '://' in url:
+        return url
+    path = url.lstrip('/')
+    if path in ('', 'index.html'):
+        return SITE_ORIGIN
+    return SITE_ORIGIN + path
+
+
 def fetch_page_count_postgres(overwrite: bool = False, days: int | None = None, conn_string: str | None = None):
     """Fetch page_count visits from Postgres database and write per-day raw CSV partitions.
 
@@ -611,13 +628,14 @@ def fetch_page_count_postgres(overwrite: bool = False, days: int | None = None, 
     # Try PAGE_COUNT_DATABASE_URL first, then construct from individual vars
     conn_string = conn_string or os.getenv('PAGE_COUNT_DATABASE_URL')
     if not conn_string:
-        # Construct from individual environment variables
-        db_host = os.getenv('DB_HOST', '192.168.2.3')
+        db_host = os.getenv('DB_HOST')
         db_port = os.getenv('DB_PORT', '5433')
-        db_user = os.getenv('DB_USER', 'Hd4AZn:NlSpH')
-        db_password = os.getenv('DB_PASSWORD', '8&0+6849Mx#S')
-        # Use page_count database
-        conn_string = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/page_count"
+        db_user = os.getenv('DB_USER')
+        db_password = os.getenv('DB_PASSWORD')
+        db_name = os.getenv('PAGE_COUNT_DB_NAME', 'kevsrobots_cms')
+        if not (db_host and db_user and db_password):
+            return {'source': 'page_count', 'error': 'No PAGE_COUNT_DATABASE_URL (or DB_HOST/DB_USER/DB_PASSWORD) in environment'}
+        conn_string = f"postgresql://{quote(db_user, safe='')}:{quote(db_password, safe='')}@{db_host}:{db_port}/{db_name}"
 
     # Parse and decode URL-encoded connection string
     host = port = dbname = user = password = None
@@ -662,28 +680,35 @@ def fetch_page_count_postgres(overwrite: bool = False, days: int | None = None, 
         cur = conn.cursor()
         pg_diag['attempted'] = True
 
-        # Build query with optional date filter
-        if days:
-            date_filter = f"WHERE timestamp >= CURRENT_DATE - INTERVAL '{days} days'"
-            _progress(f"Fetching page_count from last {days} days...")
+        # The page counter moved on 2026-05-13 from `visits` (timestamp) in the
+        # page_count database to `page_views` (viewed_at) in kevsrobots_cms,
+        # storing relative paths. Try the new table first, then the old one.
+        _progress(f"Fetching page_count ({'last %d days' % days if days else 'all data'})...")
+        last_error = None
+        for table, ts_col in PAGE_COUNT_TABLES:
+            date_filter = (
+                f"WHERE {ts_col} >= CURRENT_DATE - INTERVAL '{int(days)} days'" if days else ""
+            )
+            query = f"""
+                SELECT
+                    {ts_col} AS timestamp,
+                    ip_address AS ip,
+                    user_agent,
+                    url
+                FROM {table}
+                {date_filter}
+                ORDER BY {ts_col}
+            """
+            try:
+                cur.execute(query)
+                pg_diag['query'] = query
+                pg_diag['table'] = table
+                break
+            except psycopg2.errors.UndefinedTable as e:
+                conn.rollback()
+                last_error = e
         else:
-            date_filter = ""
-            _progress("Fetching all page_count data from database...")
-
-        query = f"""
-            SELECT
-                timestamp,
-                ip_address as ip,
-                user_agent,
-                url
-            FROM visits
-            {date_filter}
-            ORDER BY timestamp
-        """
-        pg_diag['query'] = query
-
-        _progress("Executing page_count query...")
-        cur.execute(query)
+            raise last_error
 
         _progress("Fetching page_count results...")
         batch_size = 10000
@@ -696,7 +721,7 @@ def fetch_page_count_postgres(overwrite: bool = False, days: int | None = None, 
                     'timestamp': row[0].isoformat() if hasattr(row[0], 'isoformat') else str(row[0]),
                     'ip': row[1],
                     'user_agent': row[2],
-                    'url': row[3],
+                    'url': absolute_page_url(row[3]),
                 })
             pg_diag['rows_fetched'] = len(rows)
             if len(rows) % 50000 == 0:
