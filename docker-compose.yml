@@ -11,12 +11,13 @@ services:
       - DUCKDB_PATH=/app/contentlake.ducklake
       - UPDATE_INTERVAL_HOURS=1
 
-      # Postgres connection for page_count
+      # Postgres connection for the page counter. Since 2026-05-13 it writes
+      # to the page_views table in kevsrobots_cms (was visits in page_count).
       - DB_HOST=${DB_HOST:-192.168.2.3}
       - DB_PORT=${DB_PORT:-5433}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
-      - PAGE_COUNT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/page_count
+      - PAGE_COUNT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${PAGE_COUNT_DB_NAME:-kevsrobots_cms}
 
       # Postgres connection for search_logs
       - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/searchlogs

@@ -48,7 +48,7 @@ The system provides:
 
 1. Docker and Docker Compose installed
 2. Access to Postgres databases:
-   - `page_count` database (visits table)
+   - `kevsrobots_cms` database (`page_views` table; before 2026-05-13 the `page_count` database, `visits` table)
    - `searchlogs` database (search_logs table)
 3. `.env` file with database credentials
 

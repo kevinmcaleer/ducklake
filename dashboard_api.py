@@ -56,6 +56,23 @@ app.add_middleware(
 # Global cache for dashboard data
 _cached_dashboard_data = None
 _cache_timestamp = None
+# Outcome of the last Postgres fetch per source, shown on /api/health
+_last_fetch = {}
+
+
+def _record_fetch(name, result):
+    pg = result.get('postgres') or {}
+    error = result.get('error') or pg.get('error')
+    _last_fetch[name] = {
+        'rows_fetched': pg.get('rows_fetched', 0),
+        'table': pg.get('table'),
+        'latest_ts': result.get('latest_ts'),
+        'error': error,
+    }
+    if error:
+        logger.error(f"{name} fetch from Postgres failed: {error}")
+    elif not pg.get('rows_fetched'):
+        logger.warning(f"{name} fetch returned no rows for the last 7 days")
 
 
 def update_lakehouse():
@@ -72,6 +89,7 @@ def update_lakehouse():
             overwrite=True,
             days=7
         )
+        _record_fetch('page_count', page_count_result)
         logger.info(f"Fetched {page_count_result.get('postgres', {}).get('rows_fetched', 0)} page_count records")
 
         logger.info("Fetching search_logs data from Postgres...")
@@ -79,6 +97,7 @@ def update_lakehouse():
             overwrite=True,
             days=7
         )
+        _record_fetch('search_logs', search_logs_result)
         logger.info(f"Fetched {search_logs_result.get('postgres', {}).get('rows_fetched', 0)} search_logs records")
 
         # Refresh DuckDB lakehouse
@@ -190,11 +209,13 @@ async def health_check():
     db_exists = Path(DB_PATH).exists()
     cache_exists = _cached_dashboard_data is not None
 
+    fetch_failed = any(f.get('error') or not f.get('rows_fetched') for f in _last_fetch.values())
     return {
-        "status": "healthy" if (db_exists and cache_exists) else "degraded",
+        "status": "healthy" if (db_exists and cache_exists and not fetch_failed) else "degraded",
         "database_exists": db_exists,
         "cache_loaded": cache_exists,
-        "last_updated": _cache_timestamp
+        "last_updated": _cache_timestamp,
+        "last_fetch": _last_fetch,
     }
 
 
